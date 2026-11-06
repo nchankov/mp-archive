@@ -153,7 +153,7 @@ mp-archive uses a Box app to get access to your Box account.
 You can use one Box app for all your Box accounts. You can also make one app in each account.
 
 **N.B! It's important to create the app by logging in using the link above as otherwise the app couldn't 
-save the "OAuth 2.0 Redirect URIs" nor any change to the config.**
+save the "OAuth 2.0 Redirect URIs" nor any change to the app config. Other accounts could use normal registration but not the dev who creates the app.**
 
 ### Step 2: Make the folders
 

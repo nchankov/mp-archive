@@ -406,12 +406,27 @@ The command does these steps:
 
 1. It finds the parts of the backup in all accounts.
 2. It skips accounts that have no part of this backup.
-3. It downloads the parts, joins them in the correct order, and extracts the archive.
-4. It deletes the temporary parts.
+3. It downloads the parts and joins them in the correct order.
+4. It checks the list of files in the archive. See [Safety checks of the restore](#safety-checks-of-the-restore).
+5. It extracts the archive into a new empty temporary folder in the target directory. Then it moves the restored file or folder into the target directory.
+6. It deletes the temporary parts.
 
 The archive keeps the name of the original file or folder. In the examples, the result is the folder `./restore/backup1` and the file `./restore/backup2.zip`.
 
-If the target directory does not exist, the command makes it. Files with the same name in the target directory are replaced.
+If the target directory does not exist, the command makes it.
+
+The command does not replace anything in the target directory. If the target directory already has an entry with the name of the restored file or folder, the command stops and restores nothing. Remove the old entry, or restore into a different directory.
+
+#### Safety checks of the restore
+
+The parts come from Box. A person who can change files in a Box folder can change a part. Thus the command checks the archive before it writes to the target directory. It stops and restores nothing if the archive has one of these members:
+
+- A name that starts with `/`, or a name with a `..` part.
+- More than one top-level file or folder.
+- A member whose path goes through a symbolic link in the same archive.
+- A hard link to an absolute path, to a `..` path, or outside the top-level folder.
+
+Symbolic links in your backup are restored as symbolic links. The command never writes through a symbolic link that is already in the target directory.
 
 If a part is missing, the command stops with the message `Archive '<name>' is incomplete`.
 

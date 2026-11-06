@@ -737,3 +737,97 @@ make_tmpdir() {
 sort_indices() {
     sort -n -u
 }
+
+# ---------------------------------------------------------------------
+# Archive member checks (restore)
+# ---------------------------------------------------------------------
+
+# Remove a "./" prefix and one "/" suffix from a member name.
+_member_norm() {
+    local n="${1-}"
+    while [[ "$n" == ./* ]]; do n="${n#./}"; done
+    printf '%s' "${n%/}"
+}
+
+# Check the member list of an archive before extraction.
+# Arguments: a file with the output of "tar -tzf" and a file with the
+# output of "tar -tvzf" for the same archive. Line i of each file is member i.
+# The archive comes from remote storage, so it is not trusted.
+# The function rejects:
+#   - an empty archive, or listings with a different count of lines
+#   - absolute names and names with a ".." part
+#   - more than one top-level entry
+#   - a member whose path goes through a symbolic link member
+#   - a hard link to an absolute path, a ".." path, or another top-level entry
+# A symbolic link member itself is accepted. Its target is not followed
+# during the restore, because no later member can go through it.
+# On success, print the top-level name and return 0.
+# On failure, log the reason and return 1.
+archive_check_members() {
+    local names_file="${1-}" verbose_file="${2-}"
+    local -a names=() lines=()
+    local -A links=()
+    local i n raw vline type target top="" part path
+    mapfile -t names <"$names_file" || return 1
+    mapfile -t lines <"$verbose_file" || return 1
+    if ((${#names[@]} == 0)); then
+        log_error "The archive is empty"
+        return 1
+    fi
+    if ((${#names[@]} != ${#lines[@]})); then
+        log_error "The archive listing is not consistent (a member name can contain a line break)"
+        return 1
+    fi
+    # Pass 1: check each name and find the link members.
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        raw="${names[i]}"
+        n="$(_member_norm "$raw")"
+        if [[ -z "$n" || "$n" == /* || "/$n/" == */../* ]]; then
+            log_error "Unsafe member name in the archive: '$raw'"
+            return 1
+        fi
+        if [[ -z "$top" ]]; then
+            top="${n%%/*}"
+        elif [[ "${n%%/*}" != "$top" ]]; then
+            log_error "The archive has more than one top-level entry: '$top' and '${n%%/*}'"
+            return 1
+        fi
+        vline="${lines[i]}"
+        type="${vline:0:1}"
+        target=""
+        if [[ "$vline" == *" $raw -> "* ]]; then
+            target="${vline#*" $raw -> "}"
+        elif [[ "$vline" == *" $raw link to "* ]]; then
+            target="${vline#*" $raw link to "}"
+            type="h"
+        fi
+        if [[ "$type" == "l" ]]; then
+            # A symbolic link. Record it. Pass 2 rejects members below it.
+            links["$n"]=1
+        elif [[ -n "$target" ]]; then
+            # A hard link (BusyBox shows it with "->" and type "-").
+            target="$(_member_norm "$target")"
+            if [[ -z "$target" || "$target" == /* || "/$target/" == */../* \
+                || "${target%%/*}" != "$top" ]]; then
+                log_error "Unsafe hard link in the archive: '$raw' -> '$target'"
+                return 1
+            fi
+        fi
+    done
+    # Pass 2: reject a member that goes through a symbolic link member.
+    # Example: the link "top/cfg" and the member "top/cfg/.env".
+    for raw in "${names[@]}"; do
+        n="$(_member_norm "$raw")"
+        path=""
+        while [[ "$n" == */* ]]; do
+            part="${n%%/*}"
+            n="${n#*/}"
+            path="${path:+$path/}$part"
+            if [[ -n "${links[$path]+set}" ]]; then
+                log_error "A member goes through the symbolic link '$path' in the archive: '$raw'"
+                return 1
+            fi
+        done
+    done
+    printf '%s\n' "$top"
+}

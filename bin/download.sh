@@ -34,9 +34,15 @@ mpa_init
 N="$MPA_ACCOUNT_COUNT"
 
 # Make a temp dir. Remove it when the script ends.
+# STAGE is the staging folder of the extraction. It is set in step 5.
 TMP="$(make_tmpdir)" || die "Cannot create a temporary directory"
+STAGE=""
 cleanup() {
     [[ -n "${TMP:-}" && -d "$TMP" ]] && rm -rf -- "$TMP"
+    # Remove a staging folder that is left after a failure.
+    # rm does not follow the symbolic links in the folder.
+    [[ -n "${STAGE:-}" && -d "$STAGE" ]] && rm -rf -- "$STAGE"
+    return 0
 }
 trap cleanup EXIT
 
@@ -92,12 +98,39 @@ for k in "${INDICES[@]}"; do
     FILES+=("$TMP/$pname")
 done
 
-# Step 5: join the parts in numeric order and extract.
-mkdir -p -- "$TARGET" || die "Cannot create the target directory '$TARGET'"
-if ! cat -- "${FILES[@]}" | tar -xzf - -C "$TARGET"; then
-    die "Extraction failed"
-fi
+# Step 5: join the parts in numeric order and check the members.
+# The parts come from remote storage, so the archive is not trusted.
+JOINED="$TMP/archive.tar.gz"
+cat -- "${FILES[@]}" >"$JOINED" || die "Cannot join the parts"
+tar -tzf "$JOINED" >"$TMP/names" 2>/dev/null || die "Extraction failed: cannot read the archive '$ARCHIVE'. Nothing is restored."
+tar -tvzf "$JOINED" >"$TMP/verbose" 2>/dev/null || die "Extraction failed: cannot read the archive '$ARCHIVE'. Nothing is restored."
+TOP="$(archive_check_members "$TMP/names" "$TMP/verbose")" \
+    || die "Archive '$ARCHIVE' has unsafe members. Nothing is restored."
 
-log_info "Restored '$ARCHIVE' (${#FILES[@]} parts) to '$TARGET'"
+# Step 6: extract into a new empty staging folder, then move the entry.
+# The extraction never writes through an entry that is already in the
+# target directory, for example a symbolic link from an earlier restore.
+mkdir -p -- "$TARGET" || die "Cannot create the target directory '$TARGET'"
+if [[ -e "$TARGET/$TOP" || -L "$TARGET/$TOP" ]]; then
+    die "'$TARGET/$TOP' exists. Remove it, or restore into a different directory."
+fi
+STAGE="$(mktemp -d -- "$TARGET/.mp-archive-restore.XXXXXX")" \
+    || die "Cannot create a staging folder in '$TARGET'"
+if ! tar -xzf "$JOINED" -C "$STAGE"; then
+    die "Extraction failed. Nothing is restored."
+fi
+# Some tar programs change member names during extraction. Thus make sure
+# that the staging folder holds only the top-level entry that was checked.
+STAGED="$(ls -A -- "$STAGE")" || die "Cannot read the staging folder"
+if [[ "$STAGED" != "$TOP" ]]; then
+    die "The extracted content does not match the archive listing. Nothing is restored."
+fi
+# -n: do not replace an entry that another process made in the meantime.
+if ! mv -nT -- "$STAGE/$TOP" "$TARGET/$TOP" || [[ -e "$STAGE/$TOP" || -L "$STAGE/$TOP" ]]; then
+    die "Cannot move '$TOP' into '$TARGET'. Nothing is restored."
+fi
+# The EXIT trap removes the empty staging folder.
+
+log_info "Restored '$ARCHIVE' (${#FILES[@]} parts) to '$TARGET/$TOP'"
 echo "$TARGET"
 exit 0

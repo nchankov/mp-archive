@@ -425,6 +425,7 @@ The parts come from Box. A person who can change files in a Box folder can chang
 - More than one top-level file or folder.
 - A member whose path goes through a symbolic link in the same archive.
 - A hard link to an absolute path, to a `..` path, or outside the top-level folder.
+- A hard link to a symbolic link in the same archive, or through one.
 
 Symbolic links in your backup are restored as symbolic links. The command never writes through a symbolic link that is already in the target directory.
 

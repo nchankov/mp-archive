@@ -742,11 +742,19 @@ sort_indices() {
 # Archive member checks (restore)
 # ---------------------------------------------------------------------
 
-# Remove a "./" prefix and one "/" suffix from a member name.
+# Normalize a member name: remove empty and "." parts, for example in
+# "./a//b/./c/". Keep a leading "/", so that the caller can reject it.
+# A ".." part is kept, so that the caller can reject it.
 _member_norm() {
-    local n="${1-}"
-    while [[ "$n" == ./* ]]; do n="${n#./}"; done
-    printf '%s' "${n%/}"
+    local n="${1-}" lead="" out="" p
+    local -a parts=()
+    [[ "$n" == /* ]] && lead="/"
+    IFS=/ read -r -a parts <<<"$n"
+    for p in "${parts[@]}"; do
+        [[ -z "$p" || "$p" == "." ]] && continue
+        out="${out:+$out/}$p"
+    done
+    printf '%s%s' "$lead" "$out"
 }
 
 # Check the member list of an archive before extraction.
@@ -759,13 +767,14 @@ _member_norm() {
 #   - more than one top-level entry
 #   - a member whose path goes through a symbolic link member
 #   - a hard link to an absolute path, a ".." path, or another top-level entry
+#   - a hard link whose target is a symbolic link member or goes through one
 # A symbolic link member itself is accepted. Its target is not followed
 # during the restore, because no later member can go through it.
 # On success, print the top-level name and return 0.
 # On failure, log the reason and return 1.
 archive_check_members() {
     local names_file="${1-}" verbose_file="${2-}"
-    local -a names=() lines=()
+    local -a names=() lines=() hard_targets=()
     local -A links=()
     local i n raw vline type target top="" part path
     mapfile -t names <"$names_file" || return 1
@@ -812,6 +821,8 @@ archive_check_members() {
                 log_error "Unsafe hard link in the archive: '$raw' -> '$target'"
                 return 1
             fi
+            # Pass 2 checks that the target does not use a symbolic link.
+            hard_targets+=("$target")
         fi
     done
     # Pass 2: reject a member that goes through a symbolic link member.
@@ -825,6 +836,22 @@ archive_check_members() {
             path="${path:+$path/}$part"
             if [[ -n "${links[$path]+set}" ]]; then
                 log_error "A member goes through the symbolic link '$path' in the archive: '$raw'"
+                return 1
+            fi
+        done
+    done
+    # A hard link target must not be a symbolic link member, and must not
+    # go through one. Some tar programs follow the link and then link to a
+    # file outside the target directory.
+    for target in "${hard_targets[@]}"; do
+        n="$target"
+        path=""
+        while [[ -n "$n" ]]; do
+            part="${n%%/*}"
+            if [[ "$n" == */* ]]; then n="${n#*/}"; else n=""; fi
+            path="${path:+$path/}$part"
+            if [[ -n "${links[$path]+set}" ]]; then
+                log_error "A hard link target uses the symbolic link '$path' in the archive: '$target'"
                 return 1
             fi
         done

@@ -17,12 +17,15 @@ At this time, mp-archive supports only Box. Support for Dropbox, pCloud and Goog
 ## Contents
 
 - [Requirements](#requirements)
+- [Installation](#installation)
 - [Files in the project](#files-in-the-project)
+- [Files outside the project](#files-outside-the-project)
 - [Setup](#setup)
 - [Add an account](#add-an-account)
 - [Commands](#commands)
 - [Access tokens and refresh tokens](#access-tokens-and-refresh-tokens)
 - [Run a backup each day](#run-a-backup-each-day)
+- [Update mp-archive](#update-mp-archive)
 - [Logs and errors](#logs-and-errors)
 - [Security](#security)
 - [Tests](#tests)
@@ -35,6 +38,65 @@ At this time, mp-archive supports only Box. Support for Dropbox, pCloud and Goog
 - One or more Box accounts. A free Box account is sufficient.
 
 mp-archive does not use `jq`, Python or other tools.
+
+## Installation
+
+The code of mp-archive is on GitHub: <https://github.com/nchankov/mp-archive>
+
+### Get the code
+
+Put the code in `/opt/mp-archive`. Use one of these two methods.
+
+**Method A: with git.** Use this method if `git` is on the server. It makes updates easy.
+
+```bash
+sudo git clone https://github.com/nchankov/mp-archive.git /opt/mp-archive
+```
+
+**Method B: without git.** This method uses only `curl` and `tar`:
+
+```bash
+sudo mkdir -p /opt/mp-archive
+curl -fsSL https://github.com/nchankov/mp-archive/archive/refs/heads/main.tar.gz \
+  | sudo tar -xz --strip-components=1 -C /opt/mp-archive
+```
+
+You can use a different folder. In this README, the project folder is `/opt/mp-archive`.
+
+The scripts in `bin/` are already executable. If they are not, make them executable:
+
+```bash
+sudo chmod 755 /opt/mp-archive/bin/*.sh
+```
+
+### Select the user that runs mp-archive
+
+Select one user for all mp-archive commands. This user owns the settings, the tokens and the logs. In this README, the user is `mparchive`. You can also use your own user. Do not use the user `backup`: Debian and Ubuntu already use this name for a system user.
+
+To make a new user `mparchive` with no login shell:
+
+```bash
+sudo useradd --system --shell /usr/sbin/nologin mparchive
+```
+
+Run each mp-archive command as this user, for example:
+
+```bash
+sudo -u mparchive /opt/mp-archive/bin/exists.sh backup1
+```
+
+If you use different users, a user can fail to read the tokens or to write the logs.
+
+### What to do after you get the code
+
+Do these steps in this sequence:
+
+1. [Make a Box app](#step-1-make-a-box-app).
+2. [Make the folders](#step-2-make-the-folders) for the settings, the tokens and the logs.
+3. [Write the settings in `.env`](#step-3-write-the-settings-in-env).
+4. [Add each Box user](#step-4-add-each-box-user).
+5. [Check the installation](#step-5-check-the-installation).
+6. [Run a backup each day](#run-a-backup-each-day) with `cron`.
 
 ## Files in the project
 
@@ -61,6 +123,8 @@ The project folder contains only code. The settings, the tokens and the logs are
 | `/var/lib/mp-archive/box/` | The tokens of each account. The scripts make this folder. | `MPARCHIVE_STATE_DIR` |
 | `/var/log/mp-archive/activity.log` | A record of all actions and errors. | `MPARCHIVE_LOG_DIR` |
 | `/var/log/mp-archive/error.log` | A record of errors only. | `MPARCHIVE_LOG_DIR` |
+
+`box.json` is always in the same folder as `.env`. Its file name comes from the `PROVIDER` setting, for example `box.json` for `PROVIDER=box`. It has no setting of its own. If you set `MPARCHIVE_CONFIG_DIR`, the scripts read `.env` and `box.json` from this folder.
 
 The paths in the table are the defaults. To change a folder, set its variable:
 
@@ -93,11 +157,11 @@ save the "OAuth 2.0 Redirect URIs" nor any change to the config.**
 
 ### Step 2: Make the folders
 
-Make the three folders. Give them to the user who runs mp-archive. In this example, the user is `backup`:
+Make the three folders. Give them to the user who runs mp-archive (see [Select the user that runs mp-archive](#select-the-user-that-runs-mp-archive)). In this example, the user is `mparchive`:
 
 ```bash
 sudo mkdir -p /etc/mp-archive /var/lib/mp-archive /var/log/mp-archive
-sudo chown backup: /etc/mp-archive /var/lib/mp-archive /var/log/mp-archive
+sudo chown mparchive: /etc/mp-archive /var/lib/mp-archive /var/log/mp-archive
 sudo chmod 700 /etc/mp-archive /var/lib/mp-archive
 ```
 
@@ -107,10 +171,10 @@ If you cannot use `sudo`, use folders in your home folder. Write `MPARCHIVE_LOG_
 
 ### Step 3: Write the settings in `.env`
 
-Copy the template `.env.example` to `/etc/mp-archive/.env`:
+Copy the template `.env.example` from the project folder to `/etc/mp-archive/.env`:
 
 ```bash
-cp .env.example /etc/mp-archive/.env
+sudo -u mparchive cp /opt/mp-archive/.env.example /etc/mp-archive/.env
 ```
 
 Then write your values in `/etc/mp-archive/.env`. The file has these settings:
@@ -140,18 +204,19 @@ BOX_REDIRECT_URI=http://localhost
 The file has a secret. Keep it private:
 
 ```bash
-chmod 600 /etc/mp-archive/.env
+sudo -u mparchive chmod 600 /etc/mp-archive/.env
 ```
 
 If the mode of `.env` is wider than `600`, mp-archive writes a warning in `activity.log`.
 
 ### Step 4: Add each Box user
 
-Run `bin/add-account.sh` one time for each Box user.
+Run `bin/add-account.sh` one time for each Box user. The script writes the account to `/etc/mp-archive/box.json` and the tokens to `/var/lib/mp-archive/box/`.
 
-1. Run the script:
+1. Run the script as the user who runs mp-archive:
    ```bash
-   ./bin/add-account.sh
+   cd /opt/mp-archive
+   sudo -u mparchive ./bin/add-account.sh
    ```
 2. The script shows a Box login address. Open this address in a browser.
 3. Log in as the Box user that you want to add.
@@ -177,7 +242,7 @@ The name can contain only letters, digits, `.`, `_` and `-`. A name that another
 
 ### The file `box.json`
 
-You do not make `box.json` by hand. `bin/add-account.sh` makes the file when it does not exist. It adds one entry for each Box user:
+The file is `/etc/mp-archive/box.json`. You do not make it by hand. `bin/add-account.sh` makes the file when it does not exist. It adds one entry for each Box user:
 
 ```json
 {
@@ -206,6 +271,34 @@ chmod 600 /etc/mp-archive/box.json
 ```
 
 The script makes a new `box.json` with mode `600`. If the mode of the file is wider, mp-archive writes a warning in `activity.log`.
+
+### Step 5: Check the installation
+
+Do a small test backup and restore. Use a test folder with some files.
+
+1. Upload the test folder:
+   ```bash
+   cd /opt/mp-archive
+   sudo -u mparchive ./bin/upload.sh /path/to/test-folder install-test
+   ```
+2. Make sure that the backup exists. The command prints `true`:
+   ```bash
+   sudo -u mparchive ./bin/exists.sh install-test
+   ```
+3. Restore the backup to a temporary folder:
+   ```bash
+   sudo -u mparchive mkdir -p /tmp/mp-archive-restore
+   sudo -u mparchive ./bin/download.sh install-test /tmp/mp-archive-restore
+   ```
+4. Compare the restored files with the original files.
+5. Delete the test backup and the temporary folder:
+   ```bash
+   sudo -u mparchive ./bin/remove.sh install-test
+   sudo rm -rf /tmp/mp-archive-restore
+   ```
+6. Read `/var/log/mp-archive/error.log`. If the file does not exist, no error occurred.
+
+The user `mparchive` must have read access to the test folder.
 
 ## Add an account
 
@@ -240,7 +333,9 @@ The script makes a new `box.json` with mode `600`. If the mode of the file is wi
 
 ## Commands
 
-You can run the commands from any folder. Each command uses all active accounts in `box.json`.
+Each command uses all active accounts in `/etc/mp-archive/box.json`.
+
+The examples run from the project folder, `/opt/mp-archive`. From a different folder, use the full path, for example `/opt/mp-archive/bin/upload.sh`. Run the commands as the user who runs mp-archive.
 
 ### Archive names
 
@@ -383,18 +478,42 @@ If you change the `name` of an account in `box.json`, mp-archive cannot find the
 
 You can use `cron` to run a backup automatically.
 
-1. Open the cron table:
+1. Open the cron table of the user who runs mp-archive:
    ```bash
-   crontab -e
+   sudo crontab -u mparchive -e
    ```
 2. Add a line such as this one:
    ```
-   0 2 * * * /path/to/mp-archive/bin/upload.sh /path/to/backup1 backup1 >> /var/log/mp-archive/cron.log 2>&1
+   0 2 * * * /opt/mp-archive/bin/upload.sh /path/to/backup1 backup1 >> /var/log/mp-archive/cron.log 2>&1
    ```
+
+Use full paths in the cron table, because cron does not start in the project folder.
 
 This example uploads the backup each day at 02:00. Each run replaces the previous backup with the same name.
 
 A daily backup also keeps the refresh tokens valid.
+
+## Update mp-archive
+
+The settings, the tokens and the logs are not in the project folder. Thus, an update of the code does not change them.
+
+**If you used git (method A):**
+
+```bash
+cd /opt/mp-archive
+sudo git pull
+```
+
+**If you did not use git (method B):** download the code again into the same folder:
+
+```bash
+curl -fsSL https://github.com/nchankov/mp-archive/archive/refs/heads/main.tar.gz \
+  | sudo tar -xz --strip-components=1 -C /opt/mp-archive
+```
+
+After an update, compare `/opt/mp-archive/.env.example` with your `/etc/mp-archive/.env`. Add the new settings, if there are some.
+
+Do not update while a backup runs.
 
 ## Logs and errors
 
@@ -442,4 +561,4 @@ The automatic tests do not connect to Box. Run them from the project folder:
 bash tests/run.sh
 ```
 
-Do not run the tests while a backup runs. Some tests check that the log files do not change.
+The tests use temporary folders. They do not change the files in `/etc/mp-archive`, `/var/lib/mp-archive` or `/var/log/mp-archive`.

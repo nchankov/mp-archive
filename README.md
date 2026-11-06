@@ -124,6 +124,27 @@ The project folder contains only code. The settings, the tokens and the logs are
 | `/var/log/mp-archive/activity.log` | A record of all actions and errors. | `MPARCHIVE_LOG_DIR` |
 | `/var/log/mp-archive/error.log` | A record of errors only. | `MPARCHIVE_LOG_DIR` |
 
+### Where mp-archive finds `.env`
+
+mp-archive selects the config folder in this sequence:
+
+1. If `MPARCHIVE_CONFIG_DIR` is set in the environment, mp-archive uses this folder. It does not look in other folders.
+2. Else, if `/etc/mp-archive/.env` exists, mp-archive uses `/etc/mp-archive`.
+3. Else, if `.env` exists in the project folder, mp-archive uses the project folder, for example `/opt/mp-archive`.
+4. Else, mp-archive stops with the error `Settings file not found`.
+
+Use `/etc/mp-archive` on a server. The project folder is useful for a test or when you cannot use `sudo`.
+
+If `/etc/mp-archive/.env` exists but the user cannot read it, mp-archive stops with an error. It does not use the `.env` in the project folder.
+
+With a `.env` in the project folder, these rules apply:
+
+- `bin/add-account.sh` writes `box.json` in the project folder too.
+- The logs and the tokens stay in `/var/log/mp-archive` and `/var/lib/mp-archive`. To change them, set `MPARCHIVE_LOG_DIR` and `MPARCHIVE_STATE_DIR` in `.env`.
+- The `.gitignore` file keeps `.env` and `box.json` out of git.
+
+### Where mp-archive finds `box.json`
+
 `box.json` is always in the same folder as `.env`. Its file name comes from the `PROVIDER` setting, for example `box.json` for `PROVIDER=box`. It has no setting of its own. If you set `MPARCHIVE_CONFIG_DIR`, the scripts read `.env` and `box.json` from this folder.
 
 The paths in the table are the defaults. To change a folder, set its variable:
@@ -167,7 +188,7 @@ sudo chmod 700 /etc/mp-archive /var/lib/mp-archive
 
 The user must have write access to `/etc/mp-archive`, because `bin/add-account.sh` writes `box.json` in this folder.
 
-If you cannot use `sudo`, use folders in your home folder. Write `MPARCHIVE_LOG_DIR` and `MPARCHIVE_STATE_DIR` in `.env`. Set `MPARCHIVE_CONFIG_DIR` in the environment of each command, for example in `~/.profile`.
+If you cannot use `sudo`, put `.env` in the project folder (see [Where mp-archive finds `.env`](#where-mp-archive-finds-env)). Write `MPARCHIVE_LOG_DIR` and `MPARCHIVE_STATE_DIR` in `.env`, with folders in your home folder.
 
 ### Step 3: Write the settings in `.env`
 
@@ -528,7 +549,7 @@ Each line has the time, the type of the message, the name of the script and the 
 |---|---|---|
 | `no token. Run ./bin/add-account.sh and log in as ...` | The account has no login. | Run `./bin/add-account.sh` and log in as the Box user in the message. |
 | `the refresh token is expired or revoked. Run ./bin/add-account.sh and log in as ...` | The refresh token expired, or the access of the app was removed. | Run `./bin/add-account.sh` and log in as the Box user in the message. |
-| `PROVIDER is not set. Settings file not found: ...` | The settings file is not in the config folder. | Copy `.env.example` to `/etc/mp-archive/.env`, or set `MPARCHIVE_CONFIG_DIR`. |
+| `PROVIDER is not set. Settings file not found: ...` | No `.env` is in `/etc/mp-archive` or in the project folder, or no `.env` is in `MPARCHIVE_CONFIG_DIR`. | Copy `.env.example` to `/etc/mp-archive/.env`. |
 | `Cannot create log directory: ...` | The user has no write access to the log folder. | Do step 2 of the setup. Until then, the messages go only to the screen. |
 | `... must be an absolute path` | A folder setting has a relative path. | Write the full path, for example `/var/log/mp-archive`. |
 | `Box app credentials are missing` | `.env` has no `BOX_APP_CLIENT_ID` or no `BOX_APP_SECRET`. | Write the two keys in `.env`. |

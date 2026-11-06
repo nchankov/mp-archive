@@ -5,7 +5,9 @@
 # bin/lib/providers/box.sh (_box_state_dir and the mode warnings).
 # Each check runs in a new bash process. No check changes the shell of another.
 # The system folders /etc/mp-archive, /var/log/mp-archive and /var/lib/mp-archive
-# are never created. The default values are checked with a stub for mkdir.
+# are never created, read or written. The default values are checked with a stub for mkdir.
+# Each check uses a sandbox for the project folder (MPARCHIVE_ROOT) and for the
+# system config folder (MPA_DEFAULT_CONFIG_DIR). The real repo .env is never read.
 # No check may create .state, activity.log or error.log in the repo root.
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,13 +43,30 @@ _repo_snapshot() {
 # Save the state of the repo root before any check runs.
 REPO_SNAPSHOT_BEFORE="$(_repo_snapshot)"
 
+# Print the SHA-256 of the real repo .env, or "absent" when it does not exist.
+# The content is never read or printed. Only the checksum is used.
+_repo_env_sum() {
+    if [[ -f "$REPO_ROOT/.env" ]]; then
+        sha256sum -- "$REPO_ROOT/.env" | awk '{ print $1 }'
+    else
+        printf 'absent\n'
+    fi
+}
+
+# Save the checksum of the real repo .env before any check runs.
+REPO_ENV_SUM_BEFORE="$(_repo_env_sum)"
+
 # Run one check function in a new sandbox. Remove the sandbox after the check.
+# The sandbox also has a project folder (MPARCHIVE_ROOT) with no .env in it.
 # Args: <account count> <function name>
 with_sandbox() {
     local count="$1" fn="$2" rc=0
     teardown_sandbox
     setup_sandbox "$count" || { teardown_sandbox; return 1; }
+    mkdir -p -- "$SANDBOX_DIR/project-root" || { teardown_sandbox; return 1; }
+    export MPARCHIVE_ROOT="$SANDBOX_DIR/project-root"
     "$fn" || rc=$?
+    unset MPARCHIVE_ROOT SYS_CFG PROJ_ROOT
     teardown_sandbox
     return "$rc"
 }
@@ -56,6 +75,32 @@ with_sandbox() {
 # Args: <line> [line...]
 write_env() {
     printf '%s\n' "$@" > "$MPARCHIVE_CONFIG_DIR/.env"
+}
+
+# Create the system config folder (stand-in for /etc/mp-archive) in the sandbox.
+# The project folder is the sandbox MPARCHIVE_ROOT. Neither folder has a .env yet.
+# Exports SYS_CFG and PROJ_ROOT for the child processes.
+# Remove MPARCHIVE_CONFIG_DIR, so that the config folder comes from the fallback sequence.
+setup_config_folders() {
+    SYS_CFG="$SANDBOX_DIR/system-config"
+    PROJ_ROOT="$MPARCHIVE_ROOT"
+    mkdir -p -- "$SYS_CFG" || return 1
+    export SYS_CFG PROJ_ROOT
+    unset MPARCHIVE_CONFIG_DIR
+}
+
+# Write a .env file into a folder.
+# Args: <folder> <line> [line...]
+write_env_in() {
+    local folder="$1"
+    shift
+    printf '%s\n' "$@" > "$folder/.env"
+}
+
+# Write the mock accounts file into a folder.
+# Args: <folder> <account count>
+write_accounts_in() {
+    make_accounts_json "$2" > "$1/mock.json"
 }
 
 # Print the entries that a child process created in its working folder.
@@ -166,17 +211,21 @@ _check_quoted_values_in_env_file() {
 
 # Check the default values when nothing sets them. The mkdir stub records the call.
 # No real folder is created, so the system folders stay as they are.
+# The project folder has no .env, and the system config folder is a sandbox folder.
+# The child sets MPA_DEFAULT_CONFIG_DIR after it sources common.sh.
 _check_defaults_when_nothing_sets_them() {
+    setup_config_folders || return 1
     export STUB_FILE="$SANDBOX_DIR/mkdir-calls.txt"
     run_snippet 'mkdir() { printf "%s\n" "$*" >> "$STUB_FILE"; return 0; }
 source "$COMMON_SH"
+MPA_DEFAULT_CONFIG_DIR="$SYS_CFG"
 mpa_setup_paths
 rc=$?
-printf "%s|%s|%s|%s" "$MPARCHIVE_CONFIG_DIR" "$MPARCHIVE_LOG_DIR" "$MPARCHIVE_STATE_DIR" "$rc"
-exit $rc' MPARCHIVE_CONFIG_DIR MPARCHIVE_LOG_DIR MPARCHIVE_STATE_DIR
+printf "%s|%s|%s|%s|%s" "$MPARCHIVE_CONFIG_DIR" "$MPARCHIVE_LOG_DIR" "$MPARCHIVE_STATE_DIR" "$MPA_CONFIG_FALLBACK" "$rc"
+exit $rc' MPARCHIVE_CONFIG_DIR MPARCHIVE_LOG_DIR MPARCHIVE_STATE_DIR PROVIDER
     assert_eq "0" "$RC" "setup exit code" || { unset STUB_FILE; return 1; }
-    assert_eq "/etc/mp-archive|/var/log/mp-archive|/var/lib/mp-archive|0" "$OUT" \
-        "default CONFIG, LOG and STATE values" || { unset STUB_FILE; return 1; }
+    assert_eq "$SYS_CFG|/var/log/mp-archive|/var/lib/mp-archive|1|0" "$OUT" \
+        "default CONFIG, LOG and STATE values, and fallback flag" || { unset STUB_FILE; return 1; }
     assert_contains "$(cat -- "$STUB_FILE" 2>/dev/null)" "/var/log/mp-archive" \
         "default LOG folder is the one that mkdir gets" || { unset STUB_FILE; return 1; }
     unset STUB_FILE
@@ -190,6 +239,98 @@ _check_state_dir_default_with_sandbox_log_dir() {
     assert_eq "/var/lib/mp-archive|/var/lib/mp-archive/box" "$OUT" \
         "STATE_DIR default and box token folder" || return 1
     assert_eq "" "$ERR" "no error output" || return 1
+}
+
+# ---------------------------------------------------------------------
+# Config folder selection (system folder, then project folder)
+# ---------------------------------------------------------------------
+
+# Run mpa_setup_paths in a child with the sandbox system folder as MPA_DEFAULT_CONFIG_DIR.
+# Print "<config folder>|<STATE_DIR>|<fallback flag>". Set RC, OUT and ERR.
+# The child has no PROVIDER or MPARCHIVE_STATE_DIR from the environment.
+# MPARCHIVE_CONFIG_DIR is kept, so an explicit value from the caller reaches the child.
+# setup_config_folders removes it for the fallback checks.
+_run_select_config() {
+    run_snippet 'source "$COMMON_SH"; MPA_DEFAULT_CONFIG_DIR="$SYS_CFG"; mpa_setup_paths; rc=$?; printf "%s|%s|%s" "$MPARCHIVE_CONFIG_DIR" "$MPARCHIVE_STATE_DIR" "$MPA_CONFIG_FALLBACK"; exit $rc' \
+        PROVIDER MPARCHIVE_STATE_DIR
+}
+
+# Check the fallback: the system folder has no .env, the project folder has one.
+# The project folder is used, its .env is loaded, and the fallback flag is 1.
+_check_config_fallback_to_project_env() {
+    setup_config_folders || return 1
+    write_env_in "$PROJ_ROOT" "PROVIDER=mock" "MPARCHIVE_STATE_DIR=$SANDBOX_DIR/proj-state" || return 1
+    _run_select_config
+    assert_eq "0" "$RC" "setup exit code" || return 1
+    assert_eq "$PROJ_ROOT|$SANDBOX_DIR/proj-state|1" "$OUT" \
+        "project folder used, its .env loaded, fallback flag 1" || return 1
+    assert_file_missing "$SYS_CFG/.env" "system folder still has no .env" || return 1
+}
+
+# Check that the system folder wins when both folders have a .env.
+# The project values are not loaded. The fallback flag is still 1, because
+# MPARCHIVE_CONFIG_DIR was not set by the environment.
+_check_config_system_env_wins() {
+    setup_config_folders || return 1
+    write_env_in "$SYS_CFG" "PROVIDER=mock" "MPARCHIVE_STATE_DIR=$SANDBOX_DIR/sys-state" || return 1
+    write_env_in "$PROJ_ROOT" "PROVIDER=mock" "MPARCHIVE_STATE_DIR=$SANDBOX_DIR/proj-state" || return 1
+    _run_select_config
+    assert_eq "0" "$RC" "setup exit code" || return 1
+    assert_eq "$SYS_CFG|$SANDBOX_DIR/sys-state|1" "$OUT" \
+        "system folder used, project .env not loaded" || return 1
+}
+
+# Check that an unreadable system .env (mode 000) gives an error and no fallback.
+# The file exists, so the project folder must not be used. The check does not run as root,
+# because root can read a mode 000 file. The runner skips this check for root.
+_check_config_unreadable_system_env_no_fallback() {
+    setup_config_folders || return 1
+    write_env_in "$SYS_CFG" "PROVIDER=mock" "MPARCHIVE_STATE_DIR=$SANDBOX_DIR/sys-state" || return 1
+    chmod 000 -- "$SYS_CFG/.env" || return 1
+    write_env_in "$PROJ_ROOT" "PROVIDER=mock" "MPARCHIVE_STATE_DIR=$SANDBOX_DIR/proj-state" || return 1
+    assert_file_exists "$SYS_CFG/.env" "precondition: system .env exists" || return 1
+    _run_select_config
+    assert_eq "1" "$RC" "mpa_setup_paths returns 1" || return 1
+    assert_contains "$ERR" "Cannot load the settings from $SYS_CFG/.env" \
+        "error names the unreadable system .env" || return 1
+    assert_eq "$SYS_CFG|/var/lib/mp-archive|1" "$OUT" \
+        "project .env not loaded, system folder kept" || return 1
+}
+
+# Check that an explicit MPARCHIVE_CONFIG_DIR gives no fallback, even with a project .env.
+# The explicit folder has no .env, so the STATE_DIR default is used. The flag is 0.
+_check_config_explicit_no_fallback() {
+    setup_config_folders || return 1
+    write_env_in "$PROJ_ROOT" "PROVIDER=mock" "MPARCHIVE_STATE_DIR=$SANDBOX_DIR/proj-state" || return 1
+    export MPARCHIVE_CONFIG_DIR="$SANDBOX_DIR/explicit-config"
+    _run_select_config
+    assert_eq "0" "$RC" "setup exit code" || return 1
+    assert_eq "$SANDBOX_DIR/explicit-config|/var/lib/mp-archive|0" "$OUT" \
+        "explicit folder used, project .env not loaded, fallback flag 0" || return 1
+}
+
+# Check the message of mpa_init when neither folder has a .env and nothing is set.
+# The message names both paths.
+_check_init_no_env_anywhere_message() {
+    setup_config_folders || return 1
+    run_snippet 'source "$COMMON_SH"; MPA_DEFAULT_CONFIG_DIR="$SYS_CFG"; mpa_init; exit $?' \
+        PROVIDER MPARCHIVE_CONFIG_DIR MPARCHIVE_STATE_DIR
+    assert_eq "1" "$RC" "mpa_init exit code" || return 1
+    assert_contains "$ERR" "PROVIDER is not set. Settings file not found: $SYS_CFG/.env or $PROJ_ROOT/.env. Copy .env.example to one of these paths and write your values." \
+        "message names both paths" || return 1
+}
+
+# Check that mpa_init loads the accounts and the provider name from the project folder.
+# The project .env sets PROVIDER. The accounts come from <project folder>/mock.json.
+_check_init_fallback_loads_project_accounts() {
+    setup_config_folders || return 1
+    write_env_in "$PROJ_ROOT" "PROVIDER=mock" || return 1
+    write_accounts_in "$PROJ_ROOT" 2 || return 1
+    run_snippet 'source "$COMMON_SH"; MPA_DEFAULT_CONFIG_DIR="$SYS_CFG"; mpa_init; rc=$?; printf "%s|%s|%s|%s|%s" "$MPARCHIVE_CONFIG_DIR" "$PROVIDER" "$MPA_ACCOUNT_COUNT" "$(json_get_string "${MPA_ACCOUNTS[1]}" name)" "$MPA_CONFIG_FALLBACK"; exit $rc' \
+        PROVIDER MPARCHIVE_CONFIG_DIR
+    assert_eq "0" "$RC" "mpa_init exit code" || return 1
+    assert_eq "$PROJ_ROOT|mock|2|acct1|1" "$OUT" \
+        "project folder, provider from .env, two accounts from project mock.json" || return 1
 }
 
 # ---------------------------------------------------------------------
@@ -379,6 +520,14 @@ test_repo_root_unchanged() {
     assert_eq "$REPO_SNAPSHOT_BEFORE" "$after" "repo root must not change" || return 1
 }
 
+# Check that the real repo .env has the same SHA-256 as before the checks ran.
+# The content is never printed.
+test_repo_env_unchanged() {
+    local after
+    after="$(_repo_env_sum)"
+    assert_eq "$REPO_ENV_SUM_BEFORE" "$after" "real repo .env checksum must not change" || return 1
+}
+
 # ---------------------------------------------------------------------
 # Test runner. Each test runs one check in a new sandbox.
 # ---------------------------------------------------------------------
@@ -404,6 +553,12 @@ test_download_usage_error_env_log_dir() { with_sandbox 1 _check_download_usage_e
 test_box_state_dir_from_env() { with_sandbox 1 _check_box_state_dir_from_env; }
 test_box_state_dir_default() { with_sandbox 1 _check_box_state_dir_default; }
 test_box_warns_on_config_env_mode() { with_sandbox 1 _check_box_warns_on_config_env_mode; }
+test_config_fallback_to_project_env() { with_sandbox 1 _check_config_fallback_to_project_env; }
+test_config_system_env_wins() { with_sandbox 1 _check_config_system_env_wins; }
+test_config_unreadable_system_env_no_fallback() { with_sandbox 1 _check_config_unreadable_system_env_no_fallback; }
+test_config_explicit_no_fallback() { with_sandbox 1 _check_config_explicit_no_fallback; }
+test_init_no_env_anywhere_message() { with_sandbox 1 _check_init_no_env_anywhere_message; }
+test_init_fallback_loads_project_accounts() { with_sandbox 1 _check_init_fallback_loads_project_accounts; }
 
 run_test "env: LOG_DIR read from .env" test_log_dir_from_env_file
 run_test "env: STATE_DIR read from .env" test_state_dir_from_env_file
@@ -411,12 +566,23 @@ run_test "env: environment wins over .env" test_environment_wins_over_env_file
 run_test "env: quoted values in .env" test_quoted_values_in_env_file
 run_test "defaults: values when nothing sets them" test_defaults_when_nothing_sets_them
 run_test "defaults: STATE_DIR default with LOG_DIR set" test_state_dir_default_with_sandbox_log_dir
+run_test "config: fallback to project .env when system .env is missing" test_config_fallback_to_project_env
+run_test "config: system .env wins over project .env" test_config_system_env_wins
+if [[ "$(id -u)" == "0" ]]; then
+    # Root can read a mode 000 file, so this check cannot fail as root.
+    printf 'SKIP  %s (running as root)\n' "config: unreadable system .env gives no fallback"
+else
+    run_test "config: unreadable system .env gives no fallback" test_config_unreadable_system_env_no_fallback
+fi
+run_test "config: explicit MPARCHIVE_CONFIG_DIR gives no fallback" test_config_explicit_no_fallback
 run_test "paths: relative LOG_DIR is rejected" test_relative_log_dir_rejected
 run_test "paths: relative STATE_DIR is rejected" test_relative_state_dir_rejected
 run_test "paths: relative CONFIG_DIR is rejected" test_relative_config_dir_rejected
 run_test "init: mpa_init fails on relative LOG_DIR" test_mpa_init_relative_log_dir
 run_test "init: mpa_init fails on relative STATE_DIR" test_mpa_init_relative_state_dir
 run_test "init: missing .env gives Settings file not found" test_missing_env_file_message
+run_test "init: no .env anywhere gives the two-path message" test_init_no_env_anywhere_message
+run_test "init: fallback loads accounts from project folder" test_init_fallback_loads_project_accounts
 run_test "init: .env without PROVIDER gives Set PROVIDER" test_env_file_without_provider
 run_test "init: mpa_init reads paths from .env" test_mpa_init_reads_env_file_paths
 run_test "log: empty LOG_DIR writes no file in cwd" test_empty_log_dir_writes_no_file
@@ -427,5 +593,6 @@ run_test "box: _box_state_dir uses STATE_DIR" test_box_state_dir_from_env
 run_test "box: _box_state_dir default" test_box_state_dir_default
 run_test "box: provider_init mode warning reads CONFIG_DIR" test_box_warns_on_config_env_mode
 run_test "repo: root unchanged by these checks" test_repo_root_unchanged
+run_test "repo: real .env checksum unchanged by these checks" test_repo_env_unchanged
 
 finish_tests

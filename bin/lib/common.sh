@@ -565,19 +565,40 @@ MPA_DEFAULT_STATE_DIR="/var/lib/mp-archive"
 
 # Set the paths and load .env. The function does not load the accounts.
 # Priority of a value: the environment, then .env, then the default.
-# The config folder comes only from the environment or the default,
-# because .env is in this folder.
+# The config folder cannot come from .env, because .env is in this folder.
+# The function selects the config folder in this sequence:
+#   1. MPARCHIVE_CONFIG_DIR from the environment. No fallback.
+#   2. /etc/mp-archive, if /etc/mp-archive/.env exists.
+#   3. The project folder, if <project folder>/.env exists.
+#   4. /etc/mp-archive. mpa_init then shows that no .env exists.
 # Return 1 when .env cannot be read or a path is not absolute.
 # The usage handlers call this function, so that their errors reach error.log.
 mpa_setup_paths() {
-    local rc=0 var
+    local rc=0
     : "${MPARCHIVE_ROOT:=$(cd -- "${_MPA_COMMON_DIR}/../.." && pwd)}"
-    : "${MPARCHIVE_CONFIG_DIR:=$MPA_DEFAULT_CONFIG_DIR}"
+    MPA_CONFIG_FALLBACK=0
+    if [[ -z "${MPARCHIVE_CONFIG_DIR:-}" ]]; then
+        MPA_CONFIG_FALLBACK=1
+        # Use the project folder only when the system folder has no .env.
+        # Check for the file, not for read access. Thus, a .env that the
+        # user cannot read gives an error, not a silent change of file.
+        if [[ ! -f "${MPA_DEFAULT_CONFIG_DIR}/.env" && -f "${MPARCHIVE_ROOT}/.env" ]]; then
+            MPARCHIVE_CONFIG_DIR="$MPARCHIVE_ROOT"
+        else
+            MPARCHIVE_CONFIG_DIR="$MPA_DEFAULT_CONFIG_DIR"
+        fi
+    fi
     : "${MPARCHIVE_PROVIDER_DIR:=$MPARCHIVE_ROOT/bin/lib/providers}"
     : "${MPA_SCRIPT_NAME:=$(basename -- "$0")}"
     export MPARCHIVE_ROOT MPARCHIVE_CONFIG_DIR MPARCHIVE_PROVIDER_DIR MPA_SCRIPT_NAME
 
     MPA_ENV_FILE="${MPARCHIVE_CONFIG_DIR}/.env"
+    # Check the config folder before the load. A relative path must not
+    # load a .env from the current directory.
+    if [[ "$MPARCHIVE_CONFIG_DIR" != /* ]]; then
+        log_error "MPARCHIVE_CONFIG_DIR must be an absolute path (now: ${MPARCHIVE_CONFIG_DIR})."
+        return 1
+    fi
     if [[ -f "$MPA_ENV_FILE" ]]; then
         load_env_file "$MPA_ENV_FILE" || rc=1
     fi
@@ -596,12 +617,10 @@ mpa_setup_paths() {
         log_error "MPARCHIVE_LOG_DIR must be an absolute path (now: ${bad})."
         return 1
     fi
-    for var in MPARCHIVE_CONFIG_DIR MPARCHIVE_STATE_DIR; do
-        if [[ "${!var}" != /* ]]; then
-            log_error "${var} must be an absolute path (now: ${!var})."
-            rc=1
-        fi
-    done
+    if [[ "$MPARCHIVE_STATE_DIR" != /* ]]; then
+        log_error "MPARCHIVE_STATE_DIR must be an absolute path (now: ${MPARCHIVE_STATE_DIR})."
+        rc=1
+    fi
 
     if ! mkdir -p -- "$MPARCHIVE_LOG_DIR" 2>/dev/null; then
         local bad="$MPARCHIVE_LOG_DIR"
@@ -620,6 +639,9 @@ mpa_init() {
 
     if [[ -z "${PROVIDER:-}" ]]; then
         if [[ ! -f "$MPA_ENV_FILE" ]]; then
+            if [[ "${MPA_CONFIG_FALLBACK:-0}" == "1" ]]; then
+                die "PROVIDER is not set. Settings file not found: ${MPA_DEFAULT_CONFIG_DIR}/.env or ${MPARCHIVE_ROOT}/.env. Copy .env.example to one of these paths and write your values."
+            fi
             die "PROVIDER is not set. Settings file not found: ${MPA_ENV_FILE}. Copy .env.example to this path and write your values."
         fi
         die "PROVIDER is not set. Set PROVIDER in ${MPA_ENV_FILE}."

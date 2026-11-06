@@ -1,0 +1,27 @@
+# Files that mp-archive makes or changes during normal operation.
+# These files contain secrets, personal data or local results. Do not put them in git.
+# mp-archive keeps them in /etc/mp-archive, /var/lib/mp-archive and /var/log/mp-archive.
+# These rules stop a copy in the project folder from going into git.
+
+# Settings with the secret of the Box app. Use .env.example as the template.
+/.env
+
+# Account lists of the providers, and their backup copies.
+/box.json
+/dropbox.json
+/pcloud.json
+/gdrive.json
+/*.json.bak
+
+# Lock files and temporary files that the scripts make next to the account list.
+/.*.lock
+/.*.json.*
+
+# Tokens of each account.
+/.state/
+
+# Log files.
+/activity.log
+/error.log
+/cron.log
+*.log

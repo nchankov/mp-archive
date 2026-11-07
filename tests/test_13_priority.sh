@@ -402,8 +402,8 @@ test_upload_without_renice_continues() {
     assert_eq "0" "$RUN_RC" "upload exit code without renice" || return 1
     assert_contains "$(error_log_text)" "Warning: renice is not installed" \
         "upload warning for missing renice" || return 1
-    assert_file_exists "$MOCK_STORAGE_DIR/acct0/backup1.p0.tar.gz" "part 0 is stored" || return 1
-    assert_file_exists "$MOCK_STORAGE_DIR/acct1/backup1.p1.tar.gz" "part 1 is stored" || return 1
+    assert_file_exists "$MOCK_STORAGE_DIR/acct0/backup1.p0.c0.tar.gz" "part 0 is stored" || return 1
+    assert_file_exists "$MOCK_STORAGE_DIR/acct1/backup1.p1.c0.tar.gz" "part 1 is stored" || return 1
 }
 
 # Pass when a real upload runs at niceness 10 (or higher, when the caller is higher)

@@ -10,12 +10,17 @@
 #   MOCK_FREE_SPACE_<idx>    free bytes for one account
 #   MOCK_FREE_SPACE_DEFAULT  free bytes for other accounts
 #                            (default 10000000000)
+#   MOCK_MAX_FILE_<idx>      largest file size in bytes for one account.
+#   MOCK_MAX_FILE_DEFAULT    largest file size for other accounts.
+#                            Empty means no limit. An upload of a larger file
+#                            fails with code 2, like the Box error 403.
 #   MOCK_FAIL_<OP>_<idx>     when set and not empty, the call returns this code.
-#                            OP is FREE, LIST, FIND, UPLOAD, DOWNLOAD or DELETE.
+#                            OP is FREE, MAXFILE, LIST, FIND, UPLOAD, DOWNLOAD
+#                            or DELETE.
 #                            Invalid codes become 2.
 #
 # Every call appends "<OP> <idx> <name>" to "$MOCK_STORAGE_DIR/calls.log".
-# The name is "-" for FREE.
+# The name is "-" for FREE and MAXFILE.
 
 # Check the call and record it. Apply failure injection.
 # Return 0 to continue. Return a non-zero code to stop the call.
@@ -109,6 +114,23 @@ provider_get_free_space() {
     return 0
 }
 
+# Print the largest file size of one account value (empty = no limit).
+# Args: <idx>
+_mock_max_file() {
+    local var="MOCK_MAX_FILE_${1}"
+    printf '%s' "${!var:-${MOCK_MAX_FILE_DEFAULT:-}}"
+}
+
+# Print the largest file size for one account. Empty output means no limit.
+# Args: <idx>
+provider_get_max_file_size() {
+    local idx="$1"
+    _mock_enter MAXFILE "$idx" "-" || return $?
+    _mock_max_file "$idx"
+    printf '\n'
+    return 0
+}
+
 # Print "<id><TAB><name>" for each matching file in one account folder.
 # Match names that start with "<archive>.p" and end with ".tar.gz".
 # Args: <idx> <archive>
@@ -161,6 +183,14 @@ provider_upload_file() {
 
     if [[ ! -f "$src" ]]; then
         log_error "mock: upload source not found: $src"
+        return 2
+    fi
+
+    # Refuse a file that is larger than the limit of the account.
+    local max
+    max="$(_mock_max_file "$idx")"
+    if [[ -n "$max" ]] && (( $(stat -c %s -- "$src") > max )); then
+        log_error "mock: file_size_limit_exceeded: $name is larger than $max bytes"
         return 2
     fi
 

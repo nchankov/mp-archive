@@ -184,11 +184,11 @@ test_account_without_parts_is_skipped() {
 test_missing_middle_part() {
     new_sandbox 3 || return 1
     upload_content "$SANDBOX_DIR/src/data dir" backup1 || return 1
-    rm -f -- "$MOCK_STORAGE_DIR/acct1/backup1.p1.tar.gz" || return 1
+    rm -f -- "$MOCK_STORAGE_DIR/acct1/backup1.p1.c0.tar.gz" || return 1
 
     run_cmd "$DOWNLOAD" backup1 "$SANDBOX_DIR/restore/"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
-    assert_contains "$(sandbox_log error.log)" "missing part indices: 1" \
+    assert_contains "$(sandbox_log error.log)" "missing files: part 1" \
         "error.log names the missing part" || return 1
     assert_eq "" "$(temp_leftovers)" "no temp folder left after failure" || return 1
 }
@@ -214,7 +214,7 @@ test_provider_download_failure() {
 
     run_cmd "$DOWNLOAD" backup1 "$SANDBOX_DIR/restore/"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
-    assert_contains "$(sandbox_log error.log)" "Download of part 1" \
+    assert_contains "$(sandbox_log error.log)" "Download of 'backup1.p1.c0.tar.gz' from account #1 failed" \
         "error.log entry" || return 1
     assert_eq "" "$(temp_leftovers)" "no temp folder left after failure" || return 1
 }
@@ -226,7 +226,7 @@ test_corrupt_part_extraction_fails() {
     local manifest
     new_sandbox 2 || return 1
     upload_content "$SANDBOX_DIR/src/data dir" backup1 || return 1
-    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/backup1.p0.tar.gz" || return 1
+    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/backup1.p0.c0.tar.gz" || return 1
 
     # Step 1: the manifest from the upload refuses the changed part.
     run_cmd "$DOWNLOAD" backup1 "$SANDBOX_DIR/restore/"

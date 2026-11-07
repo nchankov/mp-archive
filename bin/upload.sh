@@ -51,8 +51,20 @@ BASE_NAME="$(basename -- "$FULL_PATH")"
 TOTAL="$(path_total_size "$FULL_PATH")" || die "Cannot read the size of '$CONTENT_PATH'"
 PART_SIZE="$(ceil_div "$TOTAL" "$N")"
 
-# Ask each account for the free space. Check all accounts before a decision.
-declare -a FREE=()
+# Optional limit for the size of one file in remote storage.
+# Allow leading zeros, then at most 18 digits, so the value fits in Bash math.
+CHUNK_CAP=0
+if [[ -n "${MPARCHIVE_CHUNK_MAX_BYTES:-}" ]]; then
+    if [[ ! "$MPARCHIVE_CHUNK_MAX_BYTES" =~ ^0*([0-9]{1,18})$ ]] || ((10#${BASH_REMATCH[1]} < 1)); then
+        die "MPARCHIVE_CHUNK_MAX_BYTES must be an integer of 1 or more (now: $MPARCHIVE_CHUNK_MAX_BYTES)"
+    fi
+    CHUNK_CAP=$((10#${BASH_REMATCH[1]}))
+fi
+
+# Ask each account for the free space and for the largest file size.
+# Check all accounts before a decision.
+# LIMIT[i] = the largest chunk for account i. 0 means no limit.
+declare -a FREE=() LIMIT=()
 SHORT=0
 for ((i = 0; i < N; i++)); do
     if ! FREE[i]="$(provider_get_free_space "$i")"; then
@@ -60,6 +72,19 @@ for ((i = 0; i < N; i++)); do
     fi
     if [[ ! "${FREE[i]}" =~ ^[0-9]+$ ]]; then
         die "Account #$i returned an invalid free space value"
+    fi
+    LIMIT[i]="$CHUNK_CAP"
+    if declare -F provider_get_max_file_size >/dev/null; then
+        if ! max_file="$(provider_get_max_file_size "$i")"; then
+            die "Cannot get the largest file size of account #$i"
+        fi
+        if [[ -n "$max_file" ]]; then
+            [[ "$max_file" =~ ^[0-9]{1,18}$ ]] || die "Account #$i returned an invalid largest file size"
+            max_file=$((10#$max_file))
+            if ((max_file > 0 && (LIMIT[i] == 0 || max_file < LIMIT[i]))); then
+                LIMIT[i]="$max_file"
+            fi
+        fi
     fi
     if ((FREE[i] < PART_SIZE)); then
         log_error "Account #$i has ${FREE[i]} bytes free; part size $PART_SIZE bytes is required"
@@ -82,53 +107,77 @@ if ! tar -C "$PARENT_DIR" -czf "$TMP/archive.tar.gz" -- "$BASE_NAME"; then
     die "Cannot create the archive of '$CONTENT_PATH'"
 fi
 
-# Step 4: split in exactly N parts, then rename each chunk to the part name.
-# Keep the joined archive until the manifest is written in step 6.
-WIDTH="${#N}"
-if ! split -n "$N" -d -a "$WIDTH" "$TMP/archive.tar.gz" "$TMP/chunk."; then
-    die "Cannot split the archive"
-fi
-declare -a PARTS=()
-for ((i = 0; i < N; i++)); do
-    chunk="$(printf '%s/chunk.%0*d' "$TMP" "$WIDTH" "$i")"
-    PARTS[i]="$TMP/$(part_name "$ARCHIVE" "$i")"
-    if [[ -f "$chunk" ]]; then
-        mv -- "$chunk" "${PARTS[i]}"
+# Step 4: split the archive in exactly N parts. Part k is for account k.
+# Cut part k in chunks of at most LIMIT[k] bytes. Each part has at least
+# one chunk, also an empty part. Keep the joined archive until the manifest
+# is written in step 6.
+ARCHIVE_FILE="$TMP/archive.tar.gz"
+ARCHIVE_BYTES="$(file_size "$ARCHIVE_FILE")" || die "Cannot read the size of the archive"
+PART_BYTES="$(ceil_div "$ARCHIVE_BYTES" "$N")"
+declare -a SIZES=() CHUNKS=() CHUNK_FILES=()
+for ((k = 0; k < N; k++)); do
+    start=$((k * PART_BYTES))
+    len=$((ARCHIVE_BYTES - start))
+    ((len > PART_BYTES)) && len="$PART_BYTES"
+    ((len < 0)) && len=0
+    SIZES[k]="$len"
+    step="${LIMIT[k]}"
+    ((step == 0 || step > len)) && step="$len"
+    if ((len == 0)); then
+        count=1
     else
-        # Split can skip empty parts. Make an empty file for the part.
-        : > "${PARTS[i]}"
+        count="$(ceil_div "$len" "$step")"
     fi
+    if ((count > MPA_MAX_CHUNKS)); then
+        die "Part $k needs $count files of at most ${LIMIT[k]} bytes; the maximum is $MPA_MAX_CHUNKS. Use a larger MPARCHIVE_CHUNK_MAX_BYTES or more accounts."
+    fi
+    CHUNKS[k]="$count"
+    for ((j = 0; j < count; j++)); do
+        off=$((start + j * step))
+        clen=$((len - j * step))
+        ((clen > step)) && clen="$step"
+        cfile="$TMP/$(chunk_name "$ARCHIVE" "$k" "$j")"
+        # tail reads from the offset (it does not read the bytes before it).
+        # head stops tail after clen bytes. Code 141 (SIGPIPE) of tail is normal.
+        if ! (set -o pipefail; { tail -c "+$((off + 1))" -- "$ARCHIVE_FILE" || [[ $? -eq 141 ]]; } | head -c "$clen" >"$cfile"); then
+            die "Cannot cut chunk $j of part $k"
+        fi
+        [[ "$(file_size "$cfile")" == "$clen" ]] || die "Chunk $j of part $k has a wrong size"
+        CHUNK_FILES+=("$cfile")
+    done
 done
 
 # Step 5: second safety check on the real part sizes.
 TOTAL_BYTES=0
-declare -a SIZES=()
-for ((i = 0; i < N; i++)); do
-    SIZES[i]="$(file_size "${PARTS[i]}")"
-    TOTAL_BYTES=$((TOTAL_BYTES + SIZES[i]))
-    if ((SIZES[i] > FREE[i])); then
-        die "Part $i is ${SIZES[i]} bytes but account #$i has ${FREE[i]} bytes free; upload cancelled"
+for ((k = 0; k < N; k++)); do
+    TOTAL_BYTES=$((TOTAL_BYTES + SIZES[k]))
+    if ((SIZES[k] > FREE[k])); then
+        die "Part $k is ${SIZES[k]} bytes but account #$k has ${FREE[k]} bytes free; upload cancelled"
     fi
 done
 
-# Step 6: upload part i to account i.
-for ((i = 0; i < N; i++)); do
-    if ! provider_upload_file "$i" "${PARTS[i]}" "$(part_name "$ARCHIVE" "$i")"; then
-        die "Upload of part $i to account #$i failed"
+# Step 6: upload the chunks of part k to account k.
+for cfile in "${CHUNK_FILES[@]}"; do
+    cname="${cfile##*/}"
+    read -r k j _ <<<"$(part_parse_name "$ARCHIVE" "$cname")"
+    if ! provider_upload_file "$k" "$cfile" "$cname"; then
+        die "Upload of part $k, chunk $j ('$cname') to account #$k failed"
     fi
-    log_info "Uploaded part $i ($(part_name "$ARCHIVE" "$i"), ${SIZES[i]} bytes) to account #$i"
+    log_info "Uploaded part $k, chunk $((j + 1)) of ${CHUNKS[k]} ($cname, $(file_size "$cfile") bytes) to account #$k"
 done
 
-# Write the manifest only after all parts are uploaded. download.sh uses it
-# to find parts that were changed in remote storage.
-if manifest_write "$ARCHIVE" "$TMP/archive.tar.gz" "${PARTS[@]}"; then
+# Write the manifest only after all chunks are uploaded. download.sh uses it
+# to find files that were changed in remote storage.
+if manifest_write "$ARCHIVE" "$ARCHIVE_FILE" "${CHUNK_FILES[@]}"; then
     log_info "Wrote the manifest '$(manifest_path "$ARCHIVE")'"
 else
     log_error "Warning: cannot write the manifest of '$ARCHIVE'. A restore cannot verify the parts."
 fi
-rm -f -- "$TMP/archive.tar.gz"
+rm -f -- "$ARCHIVE_FILE"
 
-# Step 7: remove old parts with another index. This step never changes the exit code.
+# Step 7: remove the files of this archive that the new upload did not write:
+# files in the old format, files of another part, and chunks with a higher
+# index. This step never changes the exit code.
 for ((j = 0; j < N; j++)); do
     if ! LISTING="$(provider_list_files "$j" "$ARCHIVE")"; then
         log_error "Warning: cannot list old parts of '$ARCHIVE' in account #$j"
@@ -137,11 +186,12 @@ for ((j = 0; j < N; j++)); do
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         name="${line#*$'\t'}"
-        idx=""
-        if ! idx="$(part_index_from_name "$ARCHIVE" "$name")"; then
+        parsed=""
+        if ! parsed="$(part_parse_name "$ARCHIVE" "$name")"; then
             continue
         fi
-        if ((idx != j)); then
+        read -r pk pj pformat <<<"$parsed"
+        if [[ "$pformat" != "c" ]] || ((pk != j || pj >= CHUNKS[j])); then
             if provider_delete_file "$j" "$name"; then
                 log_info "Removed old part '$name' from account #$j"
             else
@@ -154,5 +204,6 @@ done
 # Step 8: print the summary.
 echo "Archive: $ARCHIVE"
 echo "Parts: $N"
+echo "Files: ${#CHUNK_FILES[@]}"
 echo "Total bytes: $TOTAL_BYTES"
 exit 0

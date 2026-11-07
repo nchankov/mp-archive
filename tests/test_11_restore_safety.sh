@@ -120,13 +120,15 @@ assert_clean() {
     assert_eq "" "$(temp_leftovers)" "no temp folder left" || return 1
 }
 
-# Store a plain tar as part 0 (gzip) in account 0, and an empty part 1 in account 1.
+# Store a plain tar as chunk 0 of part 0 (gzip) in account 0, and an empty
+# chunk 0 of part 1 in account 1. The names are the chunk names of the
+# current format.
 # Args: <archive name> <plain tar path>
 store_crafted() {
     local name="$1" plain="$2" dir="$MOCK_STORAGE_DIR"
     mkdir -p -- "$dir/acct0" "$dir/acct1" || return 1
-    gzip -c -n -- "$plain" > "$dir/acct0/$(part_name "$name" 0)" || return 1
-    : > "$dir/acct1/$(part_name "$name" 1)" || return 1
+    gzip -c -n -- "$plain" > "$dir/acct0/$(chunk_name "$name" 0 0)" || return 1
+    : > "$dir/acct1/$(chunk_name "$name" 1 0)" || return 1
 }
 
 # Make a content folder with a real file and two symbolic links.
@@ -542,7 +544,7 @@ test_corrupt_part_refused_by_manifest() {
     new_sandbox 2 || return 1
     make_tree || return 1
     upload_content "$SANDBOX_DIR/src/tree" corrupt || return 1
-    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/$(part_name corrupt 0)" || return 1
+    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/$(chunk_name corrupt 0 0)" || return 1
 
     run_cmd "$DOWNLOAD" corrupt "$TARGET"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
@@ -558,7 +560,7 @@ test_corrupt_part_logs_extraction_failed() {
     new_sandbox 2 || return 1
     make_tree || return 1
     upload_content "$SANDBOX_DIR/src/tree" corrupt || return 1
-    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/$(part_name corrupt 0)" || return 1
+    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/$(chunk_name corrupt 0 0)" || return 1
     assert_file_exists "$(manifest_path corrupt)" "manifest exists after the upload" || return 1
     rm -f -- "$(manifest_path corrupt)" || return 1
     rm -f -- "$MPARCHIVE_LOG_DIR/error.log" || return 1

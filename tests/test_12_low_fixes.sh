@@ -100,14 +100,15 @@ manifest_file() {
     printf '%s/manifests/%s.manifest\n' "$MPARCHIVE_STATE_DIR" "$1"
 }
 
-# Print the path of the stored part i. Upload puts part i in account i.
+# Print the path of the stored chunk 0 of part i. Upload puts part i in account i.
+# Each small part is one chunk, so the chunk index is 0.
 # Args: <archive name> <index>
 stored_part() {
-    printf '%s/acct%s/%s\n' "$MOCK_STORAGE_DIR" "$2" "$(part_name "$1" "$2")"
+    printf '%s/acct%s/%s\n' "$MOCK_STORAGE_DIR" "$2" "$(chunk_name "$1" "$2" 0)"
 }
 
-# Print the manifest text that an upload of N parts must write.
-# The joined archive is the parts in index order.
+# Print the manifest text that an upload of N parts must write (version 2).
+# The joined archive is the parts in index order. Each part line has the file name.
 # Args: <archive name> <part count>
 expected_manifest() {
     local name="$1" count="$2" i part joined="$SANDBOX_DIR/joined.check"
@@ -115,11 +116,12 @@ expected_manifest() {
     for ((i = 0; i < count; i++)); do
         cat -- "$(stored_part "$name" "$i")" >> "$joined" || return 1
     done
-    printf 'version 1\narchive %s\nparts %s\nbytes %s\nsha256 %s\n' \
+    printf 'version 2\narchive %s\nparts %s\nbytes %s\nsha256 %s\n' \
         "$name" "$count" "$(file_size "$joined")" "$(file_hash "$joined")"
     for ((i = 0; i < count; i++)); do
         part="$(stored_part "$name" "$i")"
-        printf 'part %s %s %s\n' "$i" "$(file_size "$part")" "$(file_hash "$part")"
+        printf 'part %s %s %s %s\n' "$i" "$(file_size "$part")" "$(file_hash "$part")" \
+            "$(chunk_name "$name" "$i" 0)"
     done
 }
 
@@ -240,7 +242,7 @@ test_upload_failure_writes_no_manifest() {
     export MOCK_FAIL_UPLOAD_1=2
     run_cmd "$UPLOAD" "$SANDBOX_DIR/src/data dir" backup1
     assert_eq "1" "$RUN_RC" "upload exit code" || return 1
-    assert_contains "$(sandbox_log error.log)" "Upload of part 1 to account #1 failed" \
+    assert_contains "$(sandbox_log error.log)" "Upload of part 1, chunk 0 ('backup1.p1.c0.tar.gz') to account #1 failed" \
         "error.log entry" || return 1
     assert_file_missing "$(manifest_file backup1)" "no manifest after a failed upload" || return 1
     assert_eq "" "$(find "$MPARCHIVE_STATE_DIR" -type f 2>/dev/null)" \
@@ -274,12 +276,12 @@ test_verify_extra_part_refused() {
     new_sandbox 2 || return 1
     upload_content "$SANDBOX_DIR/src/data dir" backup1 || return 1
     mkdir -p -- "$MOCK_STORAGE_DIR/acct2" || return 1
-    cp -- "$(stored_part backup1 0)" "$MOCK_STORAGE_DIR/acct2/$(part_name backup1 2)" || return 1
+    cp -- "$(stored_part backup1 0)" "$MOCK_STORAGE_DIR/acct2/$(chunk_name backup1 2 0)" || return 1
     make_accounts_json 3 > "$MPARCHIVE_CONFIG_DIR/mock.json" || return 1
 
     run_cmd "$DOWNLOAD" backup1 "$TARGET"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
-    assert_contains "$(sandbox_log error.log)" "has 3 parts, but the manifest has 2" \
+    assert_contains "$(sandbox_log error.log)" "has 3 files, but the manifest has 2" \
         "error.log text" || return 1
     assert_file_missing "$TARGET" "no target folder after a refusal" || return 1
     assert_clean "$TARGET" || return 1
@@ -293,7 +295,7 @@ test_verify_fewer_parts_refused() {
 
     run_cmd "$DOWNLOAD" backup1 "$TARGET"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
-    assert_contains "$(sandbox_log error.log)" "has 2 parts, but the manifest has 3" \
+    assert_contains "$(sandbox_log error.log)" "has 2 files, but the manifest has 3" \
         "error.log text" || return 1
     assert_file_missing "$TARGET" "no target folder after a refusal" || return 1
     assert_clean "$TARGET" || return 1
@@ -361,9 +363,9 @@ test_decoy_index_fails_fast() {
     assert_clean "$TARGET" || return 1
 }
 
-# Pass when a missing list lists 20 indices and gives the full count (25).
+# Pass when a missing list lists 20 entries and gives the full count (25).
 test_missing_index_list_is_capped() {
-    local i line want
+    local i line want="" sep=""
     new_sandbox 30 || return 1
     upload_content "$SANDBOX_DIR/src/data dir" backup1 || return 1
     for ((i = 1; i <= 25; i++)); do
@@ -373,9 +375,12 @@ test_missing_index_list_is_capped() {
     run_cmd "$DOWNLOAD" backup1 "$TARGET"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
     line="$(error_line "is incomplete")"
-    assert_contains "$line" "25 missing part indices: " "error.log gives the full count" || return 1
-    want="$(seq -s ', ' 1 20)"
-    assert_eq "$want" "${line##*missing part indices: }" "the list has the first 20 indices only" || return 1
+    assert_contains "$line" "25 missing files: " "error.log gives the full count" || return 1
+    for ((i = 1; i <= 20; i++)); do
+        want+="${sep}part $i"
+        sep=", "
+    done
+    assert_eq "$want" "${line##*missing files: }" "the list has the first 20 entries only" || return 1
     assert_file_missing "$TARGET" "no target folder after a missing part" || return 1
 }
 
@@ -434,8 +439,8 @@ test_gzip_bomb_refused_by_cap() {
 store_crafted_bomb() {
     local name="$1" plain="$2" dir="$MOCK_STORAGE_DIR"
     mkdir -p -- "$dir/acct0" "$dir/acct1" || return 1
-    gzip -c -n -- "$plain" > "$dir/acct0/$(part_name "$name" 0)" || return 1
-    : > "$dir/acct1/$(part_name "$name" 1)" || return 1
+    gzip -c -n -- "$plain" > "$dir/acct0/$(chunk_name "$name" 0 0)" || return 1
+    : > "$dir/acct1/$(chunk_name "$name" 1 0)" || return 1
 }
 
 # Pass when an archive with 401 files and folders is refused by a limit of 100.
@@ -632,7 +637,7 @@ test_manifest_hash_failure_warns_and_exits_zero() {
     cat > "$shim_dir/sha256sum" <<EOF
 #!/bin/bash
 # Fail for part 0 only. Other calls run the real program.
-case "\$*" in *.p0.tar.gz*) exit 1 ;; esac
+case "\$*" in *.p0.c0.tar.gz*) exit 1 ;; esac
 exec "$real" "\$@"
 EOF
     chmod +x -- "$shim_dir/sha256sum" || return 1

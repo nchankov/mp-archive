@@ -290,6 +290,48 @@ test_free_space_unlimited() {
     box_end
 }
 
+# Check that the largest file size is the max_upload_size of the account.
+# The request asks for this field only.
+test_max_file_size_value() {
+    box_begin || return 1
+    box_setup || return 1
+    mock_route GET '*users/me*' 200 '{"type":"user","max_upload_size":262144000}' "" sticky
+    assert_eq "262144000" "$(provider_get_max_file_size 0)" || return 1
+    assert_contains "$(mock_calls GET '*users/me*')" \
+        "https://api.box.com/2.0/users/me?fields=max_upload_size" || return 1
+    box_end
+}
+
+# Check that a missing or invalid max_upload_size gives no output and return code 0.
+# An empty output means no limit for upload.sh.
+test_max_file_size_missing_or_invalid() {
+    local out rc
+    box_begin || return 1
+    box_setup || return 1
+    mock_route GET '*users/me*' 200 '{"type":"user","login":"user@example.test"}'
+    mock_route GET '*users/me*' 200 '{"type":"user","max_upload_size":-1}'
+    mock_route GET '*users/me*' 200 '{"type":"user","max_upload_size":"big"}'
+    for _ in 1 2 3; do
+        rc=0
+        out="$(provider_get_max_file_size 0)" || rc=$?
+        assert_eq "0" "$rc" "return code when the value is not usable" || return 1
+        assert_eq "" "$out" "no output when the value is not usable" || return 1
+    done
+    box_end
+}
+
+# Check that an API error gives a non-zero return code and no size.
+test_max_file_size_api_error() {
+    local out rc=0
+    box_begin || return 1
+    box_setup || return 1
+    mock_route GET '*users/me*' 401 '{"type":"error","status":401,"code":"unauthorized"}'
+    out="$(provider_get_max_file_size 0 2>/dev/null)" || rc=$?
+    assert_ne "0" "$rc" "an API error gives a non-zero return code" || return 1
+    assert_eq "" "$out" "no size after an API error" || return 1
+    box_end
+}
+
 # ---------------------------------------------------------------------------
 # Tests: listing, find and delete
 # ---------------------------------------------------------------------------
@@ -725,6 +767,9 @@ test_sha1_base64_helper() {
 run_test "provider_init folder id rules" test_init_folder_id_rules
 run_test "free space math" test_free_space_math
 run_test "free space unlimited" test_free_space_unlimited
+run_test "max file size from max_upload_size" test_max_file_size_value
+run_test "max file size missing or invalid is empty" test_max_file_size_missing_or_invalid
+run_test "max file size API error" test_max_file_size_api_error
 run_test "list files filters folders and other archives" test_list_files_filters
 run_test "list files pagination" test_list_files_pagination
 run_test "find file found and not found" test_find_file

@@ -48,8 +48,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Step 1: list the parts in each account. SOURCE[k] = account that holds part k.
-declare -A SOURCE=()
+# Step 1: list the files of the archive in each account.
+# New format: chunk j of part k ("<archive>.p<k>.c<j>.tar.gz").
+#   CSRC["k:j"] = account that holds the chunk. MAXC[k] = highest chunk index.
+# Old format: one file for each part ("<archive>.p<k>.tar.gz").
+#   PSRC[k] = account that holds the part.
+declare -A CSRC=() PSRC=() MAXC=()
 for ((i = 0; i < N; i++)); do
     if ! LISTING="$(provider_list_files "$i" "$ARCHIVE")"; then
         die "Cannot list the files of account #$i"
@@ -58,20 +62,33 @@ for ((i = 0; i < N; i++)); do
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         name="${line#*$'\t'}"
-        if ! idx="$(part_index_from_name "$ARCHIVE" "$name")"; then
+        if ! parsed="$(part_parse_name "$ARCHIVE" "$name")"; then
             continue
         fi
+        read -r idx cidx format <<<"$parsed"
         # upload.sh makes exactly N parts (0 to N-1). An index of N or higher
         # is not valid. Stop at once: a loop up to a very large index would
-        # not end. Do not ignore the part, because an inactive account also
+        # not end. Do not ignore the file, because an inactive account also
         # causes this.
         if ((idx >= N)); then
             die "Archive '$ARCHIVE': file '$name' in account #$i has part index $idx, but only $N active accounts exist. Make sure that all accounts that hold parts are active, or remove this file."
         fi
+        if ((cidx >= MPA_MAX_CHUNKS)); then
+            die "Archive '$ARCHIVE': file '$name' in account #$i has chunk index $cidx; the maximum is $((MPA_MAX_CHUNKS - 1))."
+        fi
         FOUND=1
         # Prefer account k for part k. Else keep the first account that has it.
-        if [[ -z "${SOURCE[$idx]:-}" ]] || ((idx == i)); then
-            SOURCE[$idx]="$i"
+        if [[ "$format" == "c" ]]; then
+            if [[ -z "${CSRC[$idx:$cidx]:-}" ]] || ((idx == i)); then
+                CSRC[$idx:$cidx]="$i"
+            fi
+            if [[ -z "${MAXC[$idx]:-}" ]] || ((cidx > MAXC[$idx])); then
+                MAXC[$idx]="$cidx"
+            fi
+        else
+            if [[ -z "${PSRC[$idx]:-}" ]] || ((idx == i)); then
+                PSRC[$idx]="$i"
+            fi
         fi
     done <<< "$LISTING"
     if ((FOUND == 0)); then
@@ -79,41 +96,76 @@ for ((i = 0; i < N; i++)); do
     fi
 done
 
-# Step 2: stop if no part exists.
-if ((${#SOURCE[@]} == 0)); then
+# Step 2: select the format. Stop if no file exists.
+# A file in the old format can stay after an upload in the new format, when
+# the removal of old files failed. The new format is the newer upload.
+if ((${#CSRC[@]} > 0)); then
+    FORMAT="c"
+    if ((${#PSRC[@]} > 0)); then
+        log_error "Warning: archive '$ARCHIVE' also has files in the old format. They are not used. Upload the archive again to remove them."
+    fi
+    mapfile -t INDICES < <(printf '%s\n' "${!MAXC[@]}" | sort_indices)
+elif ((${#PSRC[@]} > 0)); then
+    FORMAT="p"
+    mapfile -t INDICES < <(printf '%s\n' "${!PSRC[@]}" | sort_indices)
+else
     die "Archive '$ARCHIVE' not found in any account"
 fi
 
-# Step 3: sort the indices in numeric order and check for gaps.
-mapfile -t INDICES < <(printf '%s\n' "${!SOURCE[@]}" | sort_indices)
+# Step 3: make the list of files in the sequence of the join, and check
+# for gaps. Each index has a limit, so the loops are short.
+# Write at most 20 missing names.
 MAX="${INDICES[${#INDICES[@]} - 1]}"
-# Each index is below N, so the loop is short. Write at most 20 indices.
+declare -a ORDER_ACCT=() ORDER_NAME=()
 MISSING=""
 MISSING_COUNT=0
+add_missing() {
+    MISSING_COUNT=$((MISSING_COUNT + 1))
+    ((MISSING_COUNT <= 20)) && MISSING+="${MISSING:+, }$1"
+    return 0
+}
 for ((k = 0; k <= MAX; k++)); do
-    if [[ -z "${SOURCE[$k]:-}" ]]; then
-        MISSING_COUNT=$((MISSING_COUNT + 1))
-        ((MISSING_COUNT <= 20)) && MISSING+="${MISSING:+, }$k"
+    if [[ "$FORMAT" == "p" ]]; then
+        if [[ -z "${PSRC[$k]:-}" ]]; then
+            add_missing "part $k"
+            continue
+        fi
+        ORDER_ACCT+=("${PSRC[$k]}")
+        ORDER_NAME+=("$(part_name "$ARCHIVE" "$k")")
+        continue
     fi
+    if [[ -z "${MAXC[$k]:-}" ]]; then
+        add_missing "part $k"
+        continue
+    fi
+    for ((j = 0; j <= MAXC[$k]; j++)); do
+        if [[ -z "${CSRC[$k:$j]:-}" ]]; then
+            add_missing "part $k chunk $j"
+            continue
+        fi
+        ORDER_ACCT+=("${CSRC[$k:$j]}")
+        ORDER_NAME+=("$(chunk_name "$ARCHIVE" "$k" "$j")")
+    done
 done
 if ((MISSING_COUNT > 0)); then
-    die "Archive '$ARCHIVE' is incomplete; $MISSING_COUNT missing part indices: $MISSING"
+    die "Archive '$ARCHIVE' is incomplete; $MISSING_COUNT missing files: $MISSING"
 fi
 
-# Step 4: download all parts into the temp dir.
+# Step 4: download all files into the temp dir.
 declare -a FILES=()
-for k in "${INDICES[@]}"; do
-    pname="$(part_name "$ARCHIVE" "$k")"
-    if ! provider_download_file "${SOURCE[$k]}" "$pname" "$TMP/$pname"; then
-        die "Download of part $k ('$pname') from account #${SOURCE[$k]} failed"
+for ((n = 0; n < ${#ORDER_NAME[@]}; n++)); do
+    pname="${ORDER_NAME[n]}"
+    acct="${ORDER_ACCT[n]}"
+    if ! provider_download_file "$acct" "$pname" "$TMP/$pname"; then
+        die "Download of '$pname' from account #$acct failed"
     fi
-    # Optional limit for the size of one part.
+    # Optional limit for the size of one downloaded file.
     if [[ -n "${MPARCHIVE_PART_MAX_BYTES:-}" ]]; then
         [[ "$MPARCHIVE_PART_MAX_BYTES" =~ ^[0-9]+$ ]] || die "MPARCHIVE_PART_MAX_BYTES must be an integer"
-        psize="$(file_size "$TMP/$pname")" || die "Cannot read the size of part $k"
+        psize="$(file_size "$TMP/$pname")" || die "Cannot read the size of '$pname'"
         # 10#: a value such as "08" is decimal, not octal.
         ((psize <= 10#$MPARCHIVE_PART_MAX_BYTES)) \
-            || die "Part $k ('$pname') has $psize bytes; the limit is $MPARCHIVE_PART_MAX_BYTES. Nothing is restored."
+            || die "File '$pname' has $psize bytes; the limit is $MPARCHIVE_PART_MAX_BYTES. Nothing is restored."
     fi
     FILES+=("$TMP/$pname")
 done
@@ -200,6 +252,6 @@ if ! mv -nT -- "$STAGE/$TOP" "$TARGET/$TOP" || [[ -e "$STAGE/$TOP" || -L "$STAGE
 fi
 # The EXIT trap removes the empty staging folder.
 
-log_info "Restored '$ARCHIVE' (${#FILES[@]} parts) to '$TARGET/$TOP'"
+log_info "Restored '$ARCHIVE' ($((MAX + 1)) parts, ${#FILES[@]} files) to '$TARGET/$TOP'"
 echo "$TARGET"
 exit 0

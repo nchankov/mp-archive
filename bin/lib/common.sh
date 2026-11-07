@@ -35,6 +35,10 @@
 #   provider_delete_file <idx> <remote_name>
 #                                      Return 0 deleted, 1 not found,
 #                                      2 or more on error.
+#   provider_get_max_file_size <idx>   (optional) Print the largest file
+#                                      size in bytes that the account
+#                                      accepts. Empty output or 0 means
+#                                      no limit.
 #
 # Return code 3 from any function means "authentication failed".
 # A provider must not call "exit". A provider runs inside command
@@ -766,25 +770,61 @@ validate_archive_name() {
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
 }
 
-# Print the file name of one part.
+# File names in remote storage.
+# upload.sh splits the archive in N parts: part k goes to account k.
+# It cuts each part in chunks that the account accepts (for example, at most
+# 250 MB for a free Box account). The name of chunk j of part k is:
+#   <archive>.p<k>.c<j>.tar.gz
+# Older versions wrote one file for each part:
+#   <archive>.p<k>.tar.gz
+# download.sh and the other commands read both formats.
+
+# The maximum count of chunks in one part. A download loop stays short.
+MPA_MAX_CHUNKS=10000
+
+# Print the file name of one part in the old format (one file for each part).
 part_name() {
     printf '%s.p%s.tar.gz\n' "${1-}" "${2-}"
 }
 
-# Print the part index when the file name is "<archive>.p<digits>.tar.gz".
-# Return 1 for any other name. The function uses string operations,
-# so dots in the archive name stay literal.
-part_index_from_name() {
-    local archive="${1-}" filename="${2-}" rest digits
+# Print the file name of chunk <j> of part <k>.
+# Usage: chunk_name <archive> <k> <j>
+chunk_name() {
+    printf '%s.p%s.c%s.tar.gz\n' "${1-}" "${2-}" "${3-}"
+}
+
+# Read a file name of an archive. Print "<k> <j> <format>":
+#   <k>       the part index (the account of the part).
+#   <j>       the chunk index. It is 0 for the old format.
+#   <format>  "c" for a chunk, "p" for an old part file.
+# Return 1 when the name is not a file of this archive.
+# The pattern must match the full name. Thus, the files of an archive
+# with a longer name (for example "x.p0" for the archive "x") never match.
+part_parse_name() {
+    local archive="${1-}" filename="${2-}" rest
     local prefix="${archive}.p" suffix=".tar.gz"
     [[ -n "$archive" && "$filename" == "$prefix"* ]] || return 1
     rest="${filename#"$prefix"}"
     [[ "$rest" == *"$suffix" ]] || return 1
-    digits="${rest%"$suffix"}"
-    [[ "$digits" =~ ^[0-9]+$ ]] || return 1
+    rest="${rest%"$suffix"}"
     # Reject a number that is too long for Bash integer math.
-    ((${#digits} <= 9)) || return 1
-    printf '%d\n' "$((10#$digits))"
+    # A chunk name has no leading zeros: download.sh asks for the exact
+    # name that chunk_name makes. The old format accepts leading zeros.
+    if [[ "$rest" =~ ^(0|[1-9][0-9]{0,8})\.c(0|[1-9][0-9]{0,8})$ ]]; then
+        printf '%d %d c\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
+    elif [[ "$rest" =~ ^([0-9]{1,9})$ ]]; then
+        printf '%d 0 p\n' "$((10#${BASH_REMATCH[1]}))"
+    else
+        return 1
+    fi
+}
+
+# Print the part index when the file name is a file of the archive
+# (a chunk or an old part file). Return 1 for any other name.
+part_index_from_name() {
+    local parsed
+    parsed="$(part_parse_name "${1-}" "${2-}")" || return 1
+    printf '%s\n' "${parsed%% *}"
 }
 
 # ---------------------------------------------------------------------
@@ -1000,7 +1040,9 @@ _sha256_of() {
 }
 
 # Write the manifest of an archive. The file is replaced atomically.
-# Arguments: <archive> <joined archive file> <part file>...
+# Arguments: <archive> <joined archive file> <file>...
+# Give the files in the sequence of the join. The base name of each file
+# must be its name in remote storage.
 manifest_write() {
     local archive="${1-}" joined="${2-}" dest dir tmp i=0 f size sum
     shift 2
@@ -1010,7 +1052,7 @@ manifest_write() {
     tmp="$(umask 077; mktemp -- "${dest}.XXXXXX")" || return 1
     # A subshell: "exit 1" stops only the subshell, not the caller.
     (
-        printf 'version 1\n'
+        printf 'version 2\n'
         printf 'archive %s\n' "$archive"
         printf 'parts %d\n' "$#"
         printf 'bytes %s\n' "$(file_size "$joined")"
@@ -1018,31 +1060,40 @@ manifest_write() {
         for f in "$@"; do
             size="$(file_size "$f")" || exit 1
             sum="$(_sha256_of "$f")" || exit 1
-            printf 'part %d %s %s\n' "$i" "$size" "$sum"
+            printf 'part %d %s %s %s\n' "$i" "$size" "$sum" "${f##*/}"
             i=$((i + 1))
         done
     ) >"$tmp" || { rm -f -- "$tmp"; return 1; }
     mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
 }
 
-# Compare downloaded parts with the manifest of an archive.
-# Arguments: <archive> <joined archive file> <part file>...
+# Compare downloaded files with the manifest of an archive.
+# Arguments: <archive> <joined archive file> <file>...
+# Give the files in the sequence of the join. Version 2 also compares the
+# base name of each file with the name in the manifest.
 # Return 0 when they match, 1 when they do not match (the reason is logged),
 # and 3 when no manifest exists.
 manifest_verify() {
-    local archive="${1-}" joined="${2-}" mf key a b c want_parts="" want_bytes="" want_sum="" i=0 f
-    local -a psize=() psum=()
+    local archive="${1-}" joined="${2-}" mf key a b c d want_parts="" want_bytes="" want_sum="" i=0 f
+    local version=""
+    local -a psize=() psum=() pname=()
     shift 2
     mf="$(manifest_path "$archive")" || return 1
     [[ -f "$mf" ]] || return 3
-    while read -r key a b c; do
+    while read -r key a b c d; do
         case "$key" in
-            version) [[ "$a" == "1" ]] || { log_error "Manifest '$mf' has an unknown version"; return 1; } ;;
+            version)
+                [[ "$a" == "1" || "$a" == "2" ]] || { log_error "Manifest '$mf' has an unknown version"; return 1; }
+                version="$a"
+                ;;
             archive) [[ "$a" == "$archive" ]] || { log_error "Manifest '$mf' is for another archive"; return 1; } ;;
             parts) want_parts="$a" ;;
             bytes) want_bytes="$a" ;;
             sha256) want_sum="$a" ;;
-            part) psize[a]="$b"; psum[a]="$c" ;;
+            part)
+                [[ "$a" =~ ^[0-9]{1,9}$ ]] || { log_error "Manifest '$mf' has an invalid line"; return 1; }
+                psize[10#$a]="$b"; psum[10#$a]="$c"; pname[10#$a]="$d"
+                ;;
         esac
     done <"$mf"
     if [[ ! "$want_parts" =~ ^[0-9]+$ || -z "$want_sum" ]]; then
@@ -1050,10 +1101,14 @@ manifest_verify() {
         return 1
     fi
     if (($# != want_parts)); then
-        log_error "Archive '$archive' has $# parts, but the manifest has $want_parts"
+        log_error "Archive '$archive' has $# files, but the manifest has $want_parts"
         return 1
     fi
     for f in "$@"; do
+        if [[ "$version" == "2" && "${f##*/}" != "${pname[i]:-}" ]]; then
+            log_error "File $i of '$archive' is '${f##*/}', but the manifest has '${pname[i]:-}'. The files were changed after the upload."
+            return 1
+        fi
         if [[ "$(file_size "$f")" != "${psize[i]:-}" || "$(_sha256_of "$f")" != "${psum[i]:-}" ]]; then
             log_error "Part $i of '$archive' does not match the manifest. The part was changed after the upload."
             return 1

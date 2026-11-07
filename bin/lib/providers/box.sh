@@ -695,6 +695,26 @@ provider_get_free_space() {
   _box_with_tmp _box_free_space "$1"
 }
 
+# Print the largest file size in bytes that account <idx> accepts.
+# Box sends it as "max_upload_size" (for example, 250 MB for a free account).
+# Empty output means that Box did not send the field: no known limit.
+_box_max_file_size() {
+  local tmp="$1" idx="$2" body max rc=0
+  box_request "$idx" GET "${BOX_API}/users/me?fields=max_upload_size" "$tmp/body" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  body="$(_box_body "$tmp/body")"
+  max="$(json_get_number "$body" max_upload_size)" || max=""
+  if [[ ! "$max" =~ ^[0-9]{1,18}$ ]]; then
+    log_info "Box account #${idx}: the largest file size is not known."
+    return 0
+  fi
+  printf '%s\n' "$max"
+}
+
+provider_get_max_file_size() {
+  _box_with_tmp _box_max_file_size "$1"
+}
+
 # Print "<id><TAB><name>" for every file in the folder (all pages).
 _box_list_all() {
   local tmp="$1" idx="$2" offset=0 total body entries entry n rc

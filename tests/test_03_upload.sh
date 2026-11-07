@@ -58,21 +58,23 @@ account_files() {
 }
 
 # Print the expected stored files for one archive with N parts.
+# Each small part is one chunk, so the chunk index is always 0.
 # Args: <archive name> <part count>
 expected_parts() {
     local archive="$1" n="$2" i
     for ((i = 0; i < n; i++)); do
-        printf 'acct%d/%s.p%d.tar.gz\n' "$i" "$archive" "$i"
+        printf 'acct%d/%s.p%d.c0.tar.gz\n' "$i" "$archive" "$i"
     done | LC_ALL=C sort
 }
 
-# Concatenate the stored parts in numeric order into one file.
+# Concatenate the stored chunks in numeric order into one file.
+# Each part has one chunk (chunk 0).
 # Args: <archive name> <part count> <output file>
 join_parts() {
     local archive="$1" n="$2" out="$3" i
     : > "$out" || return 1
     for ((i = 0; i < n; i++)); do
-        cat -- "$MOCK_STORAGE_DIR/acct$i/$archive.p$i.tar.gz" >> "$out" || return 1
+        cat -- "$MOCK_STORAGE_DIR/acct$i/$archive.p$i.c0.tar.gz" >> "$out" || return 1
     done
 }
 
@@ -220,7 +222,7 @@ test_upload_provider_failure() {
     export MOCK_FAIL_UPLOAD_1=2
     run_cmd "$UPLOAD" "$SANDBOX_DIR/src/data dir" backup1
     assert_eq "1" "$RUN_RC" "exit code" || return 1
-    assert_contains "$(sandbox_log error.log)" "Upload of part 1 to account #1 failed" \
+    assert_contains "$(sandbox_log error.log)" "Upload of part 1, chunk 0 ('backup1.p1.c0.tar.gz') to account #1 failed" \
         "error.log entry" || return 1
     assert_eq "" "$(temp_leftovers)" "no temp folder left" || return 1
 }
@@ -231,14 +233,15 @@ test_upload_stale_parts_removed() {
     run_cmd "$UPLOAD" "$SANDBOX_DIR/src/data dir" backup1
     assert_eq "0" "$RUN_RC" "first upload exit code" || return 1
 
-    # Use two accounts now. Seed a stale part in account 0 as an older run could leave.
+    # Use two accounts now. Seed a stale part in account 0 in the old format
+    # ("<archive>.p<k>.tar.gz"), as an older run could leave.
     make_accounts_json 2 > "$MPARCHIVE_CONFIG_DIR/mock.json" || return 1
     printf 'stale part\n' > "$MOCK_STORAGE_DIR/acct0/backup1.p1.tar.gz" || return 1
 
     run_cmd "$UPLOAD" "$SANDBOX_DIR/src/data dir" backup1
     assert_eq "0" "$RUN_RC" "second upload exit code" || return 1
-    assert_eq "backup1.p0.tar.gz" "$(account_files 0)" "account 0 holds only p0" || return 1
-    assert_eq "backup1.p1.tar.gz" "$(account_files 1)" "account 1 holds only p1" || return 1
+    assert_eq "backup1.p0.c0.tar.gz" "$(account_files 0)" "account 0 holds only p0 chunk 0" || return 1
+    assert_eq "backup1.p1.c0.tar.gz" "$(account_files 1)" "account 1 holds only p1 chunk 0" || return 1
     assert_contains "$(sandbox_log activity.log)" "Removed old part 'backup1.p1.tar.gz' from account #0" \
         "activity.log removal entry" || return 1
 }
@@ -252,13 +255,13 @@ test_upload_reupload_overwrites() {
     mkdir -p -- "$SANDBOX_DIR/check" || return 1
     run_cmd "$UPLOAD" "$SANDBOX_DIR/src/data dir" backup1
     assert_eq "0" "$RUN_RC" "first upload exit code" || return 1
-    cp -- "$MOCK_STORAGE_DIR/acct0/backup1.p0.tar.gz" "$old" || return 1
+    cp -- "$MOCK_STORAGE_DIR/acct0/backup1.p0.c0.tar.gz" "$old" || return 1
 
     # Change the content, then upload the same name again.
     printf 'changed text\n' >> "$SANDBOX_DIR/src/data dir/notes.txt" || return 1
     run_cmd "$UPLOAD" "$SANDBOX_DIR/src/data dir" backup1
     assert_eq "0" "$RUN_RC" "second upload exit code" || return 1
-    cp -- "$MOCK_STORAGE_DIR/acct0/backup1.p0.tar.gz" "$new" || return 1
+    cp -- "$MOCK_STORAGE_DIR/acct0/backup1.p0.c0.tar.gz" "$new" || return 1
     assert_exit_code 1 cmp -s -- "$old" "$new" || return 1
     check_stored_parts backup1 2 "data dir/Screen Shot 1.png" || return 1
 }

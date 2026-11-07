@@ -6,7 +6,8 @@ mp-archive can use one or more Box accounts. When you upload a backup, mp-archiv
 
 1. It makes a compressed archive (`.tar.gz`) of a file or a folder.
 2. It divides the archive into equal parts. It makes one part for each Box account.
-3. It uploads part 0 to account 0, part 1 to account 1, and so on.
+3. It cuts each part into files that the account accepts. A free Box account accepts files of at most 250 MB.
+4. It uploads the files of part 0 to account 0, the files of part 1 to account 1, and so on.
 
 When you download a backup, mp-archive finds the parts in all accounts, joins them, and extracts the archive.
 
@@ -34,7 +35,7 @@ At this time, mp-archive supports only Box. Support for Dropbox, pCloud and Goog
 ## Requirements
 
 - Linux with Bash 4 or later.
-- The standard coreutils (`split`, `cat`, `du`, `stat`, `sha1sum`, `base64` and similar).
+- The standard coreutils (`cat`, `head`, `tail`, `du`, `stat`, `sha256sum`, `base64` and similar).
 - `curl`, `tar` and `gzip`.
 - Optional: `renice` and `ionice` from util-linux. mp-archive uses them to [lower the CPU priority and the disk priority](#cpu-priority-and-disk-priority). Most Linux systems have util-linux. If a tool is missing, mp-archive writes a warning and uses the normal priority.
 - One or more Box accounts. A free Box account is sufficient.
@@ -369,7 +370,27 @@ The examples run from the project folder, `/opt/mp-archive`. From a different fo
 
 The archive name identifies a backup. It must start with a letter or a digit. It can contain only letters, digits, `.`, `_` and `-`.
 
-In Box, the parts have names of the form `<archive_name>.p<number>.tar.gz`, for example `backup1.p0.tar.gz` and `backup1.p1.tar.gz`.
+#### Names of the files in Box
+
+Each part is in one or more files. A file of a part is a chunk. The chunks have names of the form `<archive_name>.p<part>.c<chunk>.tar.gz`. The count starts at 0. For example, a backup on 2 accounts with 2 chunks in each part has these files:
+
+| Account | Files |
+|---|---|
+| 0 | `backup1.p0.c0.tar.gz`, `backup1.p0.c1.tar.gz` |
+| 1 | `backup1.p1.c0.tar.gz`, `backup1.p1.c1.tar.gz` |
+
+Older versions of mp-archive made one file for each part, with the name `<archive_name>.p<part>.tar.gz`. You can still download, check and delete these backups. The next upload with the same name uses the new names and removes the old files.
+
+#### Size of the chunks
+
+The largest chunk for an account is the smaller of these two values:
+
+- The largest file that the account accepts. mp-archive gets this value from Box (`max_upload_size`). It is 250 MB for a free Box account.
+- `MPARCHIVE_CHUNK_MAX_BYTES` in `.env`, if you set it.
+
+Example: a 3 GB archive on 2 free accounts gives 2 parts of 1.5 GB. Each part has 7 chunks: 6 of 250 MB and 1 of about 36 MB.
+
+A part can have at most 10 000 chunks. Accounts with different plans can have chunks of different sizes.
 
 ### Upload a backup
 
@@ -387,12 +408,14 @@ Examples:
 The command does these steps:
 
 1. It calculates the size of the content and the size of each part.
-2. It gets the free space of each account. If one account does not have sufficient space for its part, the command stops before it uploads anything.
-3. It makes the archive and divides it into parts.
-4. It uploads each part to its account.
-   - Box gets parts of 50 MB or more in smaller pieces.
-5. If a backup with the same name exists, the new parts replace the old parts. If your Box plan has file versions, Box keeps the old parts as earlier versions.
-6. It removes old parts of the same backup that the new upload does not use.
+2. It gets the free space and the largest file size of each account. If one account does not have sufficient space for its part, the command stops before it uploads anything.
+3. It makes the archive and divides it into parts. It cuts each part into chunks. See [Size of the chunks](#size-of-the-chunks).
+4. It uploads the chunks of each part to its account.
+   - Box gets chunks of 50 MB or more in smaller pieces.
+5. If a backup with the same name exists, the new chunks replace the old chunks. If your Box plan has file versions, Box keeps the old chunks as earlier versions.
+6. It removes the old files of the same backup that the new upload does not use: files in the old format, and chunks with a higher number.
+
+The command needs free local space for the archive and its chunks, about 2 times the size of the compressed archive. The command uses the folder `MPARCHIVE_TMPDIR`, or `TMPDIR`, or `/tmp`.
 
 The command stops with exit code 0 if the upload is successful. Any other exit code means an error.
 
@@ -411,9 +434,9 @@ Examples:
 
 The command does these steps:
 
-1. It finds the parts of the backup in all accounts.
-2. It skips accounts that have no part of this backup.
-3. It downloads the parts and joins them in the correct order.
+1. It finds the chunks of the backup in all accounts.
+2. It skips accounts that have no chunk of this backup.
+3. It downloads the chunks and joins them in the correct order: all chunks of part 0, then all chunks of part 1, and so on.
 4. It checks the list of files in the archive. See [Safety checks of the restore](#safety-checks-of-the-restore).
 5. It extracts the archive into a new empty temporary folder in the target directory. Then it moves the restored file or folder into the target directory.
 6. It deletes the temporary parts.
@@ -439,19 +462,22 @@ Symbolic links in your backup are restored as symbolic links. The command never 
 The command also stops and restores nothing in these cases:
 
 - A part has an index that is not below the count of active accounts. `upload.sh` never makes such a part.
+- A chunk has a number of 10 000 or more.
 - The parts do not match the manifest of the archive. See [Manifest of an archive](#manifest-of-an-archive).
 - The archive can need more bytes than the free space of the target, or more files and folders than the free inodes. The command calculates an upper limit before it extracts.
-- A limit from `.env` is exceeded: `MPARCHIVE_RESTORE_MAX_BYTES`, `MPARCHIVE_RESTORE_MAX_INODES` or `MPARCHIVE_PART_MAX_BYTES`.
+- A limit from `.env` is exceeded: `MPARCHIVE_RESTORE_MAX_BYTES`, `MPARCHIVE_RESTORE_MAX_INODES` or `MPARCHIVE_PART_MAX_BYTES` (the limit for one downloaded file).
 
 #### Manifest of an archive
 
-After all parts are uploaded, `upload.sh` writes a manifest to `MPARCHIVE_STATE_DIR/manifests/<archive_name>.manifest`, for example `/var/lib/mp-archive/manifests/backup1.manifest`. The manifest has the count, the sizes and the SHA-256 values of the parts and of the joined archive.
+After all parts are uploaded, `upload.sh` writes a manifest to `MPARCHIVE_STATE_DIR/manifests/<archive_name>.manifest`, for example `/var/lib/mp-archive/manifests/backup1.manifest`. The manifest has the count, the names, the sizes and the SHA-256 values of the chunks, and the size and the SHA-256 value of the joined archive.
 
-`download.sh` compares the downloaded parts with the manifest. If a part was changed or added in Box, the command stops and restores nothing.
+`download.sh` compares the downloaded chunks with the manifest. If a chunk was changed, added or removed in Box, the command stops and restores nothing.
 
 The manifest is on the host that made the upload. If you restore on a new host, copy the `manifests` folder from a safe place first. If no manifest exists, the command writes a warning and continues. To refuse the restore in that case, set `MPARCHIVE_REQUIRE_MANIFEST=1` in `.env`.
 
-If a part is missing, the command stops with the message `Archive '<name>' is incomplete`.
+If a part or a chunk is missing, the command stops with the message `Archive '<name>' is incomplete`. A missing last chunk does not make a gap in the numbers. The manifest finds it. Without a manifest, `gzip` finds that the archive is cut, and the command stops.
+
+If an account has chunks and also files in the old format of the same backup, the command uses the chunks. It writes a warning in `error.log`.
 
 ### Check if a backup exists
 
@@ -554,7 +580,7 @@ A daily backup also keeps the refresh tokens valid.
 
 ## CPU priority and disk priority
 
-The compression and the extraction of an archive use much CPU time and much disk access. Thus, `upload.sh` and `download.sh` lower their own priorities when they start. All processes that they start (`tar`, `gzip`, `split`, `sha256sum`, `curl`) get the same priorities. The other services on the host keep their speed. A backup can take more time when the host is busy.
+The compression and the extraction of an archive use much CPU time and much disk access. Thus, `upload.sh` and `download.sh` lower their own priorities when they start. All processes that they start (`tar`, `gzip`, `tail`, `sha256sum`, `curl`) get the same priorities. The other services on the host keep their speed. A backup can take more time when the host is busy.
 
 Two settings in `.env` control the priorities:
 
@@ -620,7 +646,9 @@ Each line has the time, the type of the message, the name of the script and the 
 | `WARNING: Accounts #A and #B are the same Box user` | Two accounts use the same Box user. | Use a different Box user for one account. |
 | `... bytes free; part size ... bytes is required` | An account does not have sufficient free space. | Free some space, or add an account. |
 | `Archive '<name>' not found in any account` | No part of the backup exists. | Check the archive name with `./bin/exists.sh`. |
-| `Archive '<name>' is incomplete` | One or more parts are missing. | Make sure that all accounts that hold parts are in `box.json` and are active. |
+| `Archive '<name>' is incomplete` | One or more parts or chunks are missing. | Make sure that all accounts that hold parts are in `box.json` and are active. |
+| `code=file_size_limit_exceeded` | A chunk is larger than the largest file that the account accepts. | Set `MPARCHIVE_CHUNK_MAX_BYTES` in `.env` to a smaller value, for example `200000000`. |
+| `Part <k> needs <count> files ...` | The chunk size is so small that a part needs more than 10 000 chunks. | Use a larger `MPARCHIVE_CHUNK_MAX_BYTES`, or add accounts. |
 | `Cannot list the files of account #N` | mp-archive cannot read the account. | Read the lines above this error in `error.log`. |
 | `the same token key` | Two accounts have the same `name`, or have no `name` and use the same app. | Add a unique `name` to each account in `box.json`. |
 

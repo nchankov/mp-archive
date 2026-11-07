@@ -81,11 +81,11 @@ if ! tar -C "$PARENT_DIR" -czf "$TMP/archive.tar.gz" -- "$BASE_NAME"; then
 fi
 
 # Step 4: split in exactly N parts, then rename each chunk to the part name.
+# Keep the joined archive until the manifest is written in step 6.
 WIDTH="${#N}"
 if ! split -n "$N" -d -a "$WIDTH" "$TMP/archive.tar.gz" "$TMP/chunk."; then
     die "Cannot split the archive"
 fi
-rm -f -- "$TMP/archive.tar.gz"
 declare -a PARTS=()
 for ((i = 0; i < N; i++)); do
     chunk="$(printf '%s/chunk.%0*d' "$TMP" "$WIDTH" "$i")"
@@ -116,6 +116,15 @@ for ((i = 0; i < N; i++)); do
     fi
     log_info "Uploaded part $i ($(part_name "$ARCHIVE" "$i"), ${SIZES[i]} bytes) to account #$i"
 done
+
+# Write the manifest only after all parts are uploaded. download.sh uses it
+# to find parts that were changed in remote storage.
+if manifest_write "$ARCHIVE" "$TMP/archive.tar.gz" "${PARTS[@]}"; then
+    log_info "Wrote the manifest '$(manifest_path "$ARCHIVE")'"
+else
+    log_error "Warning: cannot write the manifest of '$ARCHIVE'. A restore cannot verify the parts."
+fi
+rm -f -- "$TMP/archive.tar.gz"
 
 # Step 7: remove old parts with another index. This step never changes the exit code.
 for ((j = 0; j < N; j++)); do

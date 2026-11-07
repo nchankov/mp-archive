@@ -537,12 +537,31 @@ test_extraction_failure_leaves_no_staging() {
     assert_clean "$TARGET" || return 1
 }
 
+# Pass when a corrupt part is refused by the manifest, with no target folder.
+test_corrupt_part_refused_by_manifest() {
+    new_sandbox 2 || return 1
+    make_tree || return 1
+    upload_content "$SANDBOX_DIR/src/tree" corrupt || return 1
+    head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/$(part_name corrupt 0)" || return 1
+
+    run_cmd "$DOWNLOAD" corrupt "$TARGET"
+    assert_eq "1" "$RUN_RC" "exit code" || return 1
+    assert_contains "$(sandbox_log error.log)" "does not match its manifest" \
+        "error.log text" || return 1
+    assert_file_missing "$TARGET" "no target folder after a manifest refusal" || return 1
+    assert_clean "$TARGET" || return 1
+}
+
 # Pass when a corrupt part gives exit 1 and the "Extraction failed" log entry.
+# The manifest is removed first, so the extraction check is the one that fails.
 test_corrupt_part_logs_extraction_failed() {
     new_sandbox 2 || return 1
     make_tree || return 1
     upload_content "$SANDBOX_DIR/src/tree" corrupt || return 1
     head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/$(part_name corrupt 0)" || return 1
+    assert_file_exists "$(manifest_path corrupt)" "manifest exists after the upload" || return 1
+    rm -f -- "$(manifest_path corrupt)" || return 1
+    rm -f -- "$MPARCHIVE_LOG_DIR/error.log" || return 1
 
     run_cmd "$DOWNLOAD" corrupt "$TARGET"
     assert_eq "1" "$RUN_RC" "exit code" || return 1
@@ -555,8 +574,10 @@ test_corrupt_part_logs_extraction_failed() {
 # The archive has a link "cfg" and a hard link "top/h" to "top/cfg/secret".
 # Known bug: the check accepts it. BusyBox tar then links "top/h" to the outside file.
 test_known_bug_hard_link_through_symlink_busybox() {
-    local d="$CRAFT/hl"
+    local d
     new_sandbox 2 || return 1
+    # Set the path after the sandbox exists. An earlier path leaks a folder.
+    d="$CRAFT/hl"
     printf 'secret\n' > "$OUTSIDE/secret" || return 1
     mkdir -p -- "$d/src/top/d" || return 1
     printf 'inside\n' > "$d/src/top/d/secret" || return 1
@@ -610,6 +631,7 @@ run_test "legit backup with links restores with GNU tar" test_legit_links_round_
 run_busybox_test "legit backup with links restores with BusyBox tar" test_legit_links_round_trip_busybox
 run_test "same archive twice into one folder is refused" test_restore_same_archive_twice
 run_test "extraction failure leaves no staging folder" test_extraction_failure_leaves_no_staging
+run_test "corrupt part is refused by the manifest" test_corrupt_part_refused_by_manifest
 run_test "corrupt part logs Extraction failed" test_corrupt_part_logs_extraction_failed
 run_known_bug "hard link to an outside file is refused with BusyBox tar" test_known_bug_hard_link_through_symlink_busybox
 run_test "real logs untouched" test_real_logs_untouched

@@ -219,11 +219,27 @@ test_provider_download_failure() {
     assert_eq "" "$(temp_leftovers)" "no temp folder left after failure" || return 1
 }
 
-# Pass when a corrupt part makes the extraction fail with exit 1 and no temp folder.
+# Pass when a corrupt part is refused by the manifest first, and when the
+# manifest is removed, the corrupt part makes the extraction fail with exit 1
+# and no temp folder.
 test_corrupt_part_extraction_fails() {
+    local manifest
     new_sandbox 2 || return 1
     upload_content "$SANDBOX_DIR/src/data dir" backup1 || return 1
     head -c 50000 /dev/urandom > "$MOCK_STORAGE_DIR/acct0/backup1.p0.tar.gz" || return 1
+
+    # Step 1: the manifest from the upload refuses the changed part.
+    run_cmd "$DOWNLOAD" backup1 "$SANDBOX_DIR/restore/"
+    assert_eq "1" "$RUN_RC" "manifest refusal exit code" || return 1
+    assert_contains "$(sandbox_log error.log)" "does not match its manifest" \
+        "manifest refusal error.log entry" || return 1
+    assert_file_missing "$SANDBOX_DIR/restore" "no target folder after a manifest refusal" || return 1
+
+    # Step 2: remove the manifest, so the extraction check runs.
+    manifest="$MPARCHIVE_STATE_DIR/manifests/backup1.manifest"
+    assert_file_exists "$manifest" "manifest exists after the upload" || return 1
+    rm -f -- "$manifest" || return 1
+    rm -f -- "$MPARCHIVE_LOG_DIR/error.log" || return 1
 
     run_cmd "$DOWNLOAD" backup1 "$SANDBOX_DIR/restore/"
     assert_eq "1" "$RUN_RC" "exit code" || return 1

@@ -183,7 +183,7 @@ Make the three folders. Give them to the user who runs mp-archive (see [Select t
 ```bash
 sudo mkdir -p /etc/mp-archive /var/lib/mp-archive /var/log/mp-archive
 sudo chown mparchive: /etc/mp-archive /var/lib/mp-archive /var/log/mp-archive
-sudo chmod 700 /etc/mp-archive /var/lib/mp-archive
+sudo chmod 700 /etc/mp-archive /var/lib/mp-archive /var/log/mp-archive
 ```
 
 The user must have write access to `/etc/mp-archive`, because `bin/add-account.sh` writes `box.json` in this folder.
@@ -429,6 +429,21 @@ The parts come from Box. A person who can change files in a Box folder can chang
 
 Symbolic links in your backup are restored as symbolic links. The command never writes through a symbolic link that is already in the target directory.
 
+The command also stops and restores nothing in these cases:
+
+- A part has an index that is not below the count of active accounts. `upload.sh` never makes such a part.
+- The parts do not match the manifest of the archive. See [Manifest of an archive](#manifest-of-an-archive).
+- The archive can need more bytes than the free space of the target, or more files and folders than the free inodes. The command calculates an upper limit before it extracts.
+- A limit from `.env` is exceeded: `MPARCHIVE_RESTORE_MAX_BYTES`, `MPARCHIVE_RESTORE_MAX_INODES` or `MPARCHIVE_PART_MAX_BYTES`.
+
+#### Manifest of an archive
+
+After all parts are uploaded, `upload.sh` writes a manifest to `MPARCHIVE_STATE_DIR/manifests/<archive_name>.manifest`, for example `/var/lib/mp-archive/manifests/backup1.manifest`. The manifest has the count, the sizes and the SHA-256 values of the parts and of the joined archive.
+
+`download.sh` compares the downloaded parts with the manifest. If a part was changed or added in Box, the command stops and restores nothing.
+
+The manifest is on the host that made the upload. If you restore on a new host, copy the `manifests` folder from a safe place first. If no manifest exists, the command writes a warning and continues. To refuse the restore in that case, set `MPARCHIVE_REQUIRE_MANIFEST=1` in `.env`.
+
 If a part is missing, the command stops with the message `Archive '<name>' is incomplete`.
 
 ### Check if a backup exists
@@ -584,6 +599,7 @@ mp-archive never writes a token or a secret to a log.
 - `.env` contains the Client Secret of your Box app. Keep the mode of this file at `600`.
 - `box.json` contains the names and the e-mail addresses of your accounts. Keep the mode of this file at `600`.
 - `/var/lib/mp-archive/box/` contains your tokens. mp-archive makes this folder with mode `700` and the files with mode `600`.
+- The log files contain the e-mail addresses of your Box accounts. mp-archive makes the log folder with mode `700` and the log files with mode `600`. It also removes the group and other permissions from existing log files.
 - Do not put `box.json`, `.env` or the token files in git or in a public backup. These files are not in the project folder. The `.gitignore` file also keeps them out of git if you copy them there.
 - If a secret or a token leaks, do these steps:
   1. Make a new Client Secret in the Developer Console.

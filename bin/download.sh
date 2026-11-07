@@ -59,6 +59,13 @@ for ((i = 0; i < N; i++)); do
         if ! idx="$(part_index_from_name "$ARCHIVE" "$name")"; then
             continue
         fi
+        # upload.sh makes exactly N parts (0 to N-1). An index of N or higher
+        # is not valid. Stop at once: a loop up to a very large index would
+        # not end. Do not ignore the part, because an inactive account also
+        # causes this.
+        if ((idx >= N)); then
+            die "Archive '$ARCHIVE': file '$name' in account #$i has part index $idx, but only $N active accounts exist. Make sure that all accounts that hold parts are active, or remove this file."
+        fi
         FOUND=1
         # Prefer account k for part k. Else keep the first account that has it.
         if [[ -z "${SOURCE[$idx]:-}" ]] || ((idx == i)); then
@@ -78,14 +85,17 @@ fi
 # Step 3: sort the indices in numeric order and check for gaps.
 mapfile -t INDICES < <(printf '%s\n' "${!SOURCE[@]}" | sort_indices)
 MAX="${INDICES[${#INDICES[@]} - 1]}"
+# Each index is below N, so the loop is short. Write at most 20 indices.
 MISSING=""
+MISSING_COUNT=0
 for ((k = 0; k <= MAX; k++)); do
     if [[ -z "${SOURCE[$k]:-}" ]]; then
-        MISSING+="${MISSING:+, }$k"
+        MISSING_COUNT=$((MISSING_COUNT + 1))
+        ((MISSING_COUNT <= 20)) && MISSING+="${MISSING:+, }$k"
     fi
 done
-if [[ -n "$MISSING" ]]; then
-    die "Archive '$ARCHIVE' is incomplete; missing part indices: $MISSING"
+if ((MISSING_COUNT > 0)); then
+    die "Archive '$ARCHIVE' is incomplete; $MISSING_COUNT missing part indices: $MISSING"
 fi
 
 # Step 4: download all parts into the temp dir.
@@ -95,6 +105,14 @@ for k in "${INDICES[@]}"; do
     if ! provider_download_file "${SOURCE[$k]}" "$pname" "$TMP/$pname"; then
         die "Download of part $k ('$pname') from account #${SOURCE[$k]} failed"
     fi
+    # Optional limit for the size of one part.
+    if [[ -n "${MPARCHIVE_PART_MAX_BYTES:-}" ]]; then
+        [[ "$MPARCHIVE_PART_MAX_BYTES" =~ ^[0-9]+$ ]] || die "MPARCHIVE_PART_MAX_BYTES must be an integer"
+        psize="$(file_size "$TMP/$pname")" || die "Cannot read the size of part $k"
+        # 10#: a value such as "08" is decimal, not octal.
+        ((psize <= 10#$MPARCHIVE_PART_MAX_BYTES)) \
+            || die "Part $k ('$pname') has $psize bytes; the limit is $MPARCHIVE_PART_MAX_BYTES. Nothing is restored."
+    fi
     FILES+=("$TMP/$pname")
 done
 
@@ -102,6 +120,19 @@ done
 # The parts come from remote storage, so the archive is not trusted.
 JOINED="$TMP/archive.tar.gz"
 cat -- "${FILES[@]}" >"$JOINED" || die "Cannot join the parts"
+
+# Compare the parts with the manifest that upload.sh wrote on this host.
+rc=0
+manifest_verify "$ARCHIVE" "$JOINED" "${FILES[@]}" || rc=$?
+if ((rc == 3)); then
+    if [[ "${MPARCHIVE_REQUIRE_MANIFEST:-0}" == "1" ]]; then
+        die "No manifest for '$ARCHIVE' in '$(manifest_path "$ARCHIVE")'. MPARCHIVE_REQUIRE_MANIFEST=1, so nothing is restored."
+    fi
+    log_error "Warning: no manifest for '$ARCHIVE' on this host. The parts cannot be verified."
+elif ((rc != 0)); then
+    die "Archive '$ARCHIVE' does not match its manifest. Nothing is restored."
+fi
+
 tar -tzf "$JOINED" >"$TMP/names" 2>/dev/null || die "Extraction failed: cannot read the archive '$ARCHIVE'. Nothing is restored."
 tar -tvzf "$JOINED" >"$TMP/verbose" 2>/dev/null || die "Extraction failed: cannot read the archive '$ARCHIVE'. Nothing is restored."
 TOP="$(archive_check_members "$TMP/names" "$TMP/verbose")" \
@@ -110,6 +141,42 @@ TOP="$(archive_check_members "$TMP/names" "$TMP/verbose")" \
 # Step 6: extract into a new empty staging folder, then move the entry.
 # The extraction never writes through an entry that is already in the
 # target directory, for example a symbolic link from an earlier restore.
+# Check the space before extraction. A small archive can expand to a very
+# large size or to very many files. The target can be absent, so measure
+# the nearest folder that exists. Create the target only after the checks.
+PROBE="$TARGET"
+while [[ ! -e "$PROBE" ]]; do
+    PROBE="$(dirname -- "$PROBE")"
+done
+INODES="$(archive_inode_bound "$TMP/names")" || die "Cannot count the archive members"
+BLOCK="$(stat -f -c %S -- "$PROBE")" || die "Cannot read the block size of '$PROBE'"
+AVAIL="$(df -P -B1 -- "$PROBE" | awk 'NR == 2 { print $4 }')"
+IAVAIL="$(df -P -i -- "$PROBE" | awk 'NR == 2 { print $4 }')"
+[[ "$BLOCK" =~ ^[0-9]+$ && "$AVAIL" =~ ^[0-9]+$ ]] || die "Cannot read the free space of '$PROBE'"
+MAX_BYTES="${MPARCHIVE_RESTORE_MAX_BYTES:-$AVAIL}"
+[[ "$MAX_BYTES" =~ ^[0-9]+$ ]] || die "MPARCHIVE_RESTORE_MAX_BYTES must be an integer"
+# 10#: a value such as "08" is decimal, not octal. An octal error must not
+# replace the cap with the free space.
+MAX_BYTES=$((10#$MAX_BYTES))
+AVAIL=$((10#$AVAIL))
+BLOCK=$((10#$BLOCK))
+((MAX_BYTES <= AVAIL)) || MAX_BYTES="$AVAIL"
+STREAM="$(archive_stream_bytes "$JOINED" "$MAX_BYTES")" \
+    || die "Extraction failed: cannot read the archive '$ARCHIVE'. Nothing is restored."
+# Each new inode can use one block more than its data in the stream.
+NEED=$((STREAM + INODES * BLOCK))
+if ((NEED > MAX_BYTES)); then
+    die "Archive '$ARCHIVE' can need more than $MAX_BYTES bytes (free: $AVAIL). Nothing is restored."
+fi
+if [[ "$IAVAIL" =~ ^[0-9]+$ ]] && ((10#$IAVAIL > 0 && INODES >= 10#$IAVAIL)); then
+    die "Archive '$ARCHIVE' can create $INODES files and folders; only $IAVAIL are free. Nothing is restored."
+fi
+if [[ -n "${MPARCHIVE_RESTORE_MAX_INODES:-}" ]]; then
+    [[ "$MPARCHIVE_RESTORE_MAX_INODES" =~ ^[0-9]+$ ]] || die "MPARCHIVE_RESTORE_MAX_INODES must be an integer"
+    ((INODES <= 10#$MPARCHIVE_RESTORE_MAX_INODES)) \
+        || die "Archive '$ARCHIVE' can create $INODES files and folders; the limit is $MPARCHIVE_RESTORE_MAX_INODES. Nothing is restored."
+fi
+
 mkdir -p -- "$TARGET" || die "Cannot create the target directory '$TARGET'"
 if [[ -e "$TARGET/$TOP" || -L "$TARGET/$TOP" ]]; then
     die "'$TARGET/$TOP' exists. Remove it, or restore into a different directory."

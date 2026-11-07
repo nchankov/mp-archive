@@ -73,8 +73,13 @@ _mpa_log() {
     # This stops log files in the current directory.
     if [[ -n "$dir" ]]; then
         for f in "$@"; do
-            # The group hides the error of the redirect too, for example a missing folder.
-            { printf '%s\n' "$line" >>"${dir}/${f}"; } 2>/dev/null || true
+            # Do not write through a symbolic link.
+            [[ -L "${dir}/${f}" ]] && continue
+            # The logs can contain account logins. Create each file with
+            # mode 600, whatever the umask of the caller is. The subshell
+            # keeps the umask of the caller. The group hides the error of
+            # the redirect too, for example a missing folder.
+            { ( umask 077; printf '%s\n' "$line" >>"${dir}/${f}" ); } 2>/dev/null || true
         done
     fi
     printf '%s\n' "$line" >&2
@@ -622,12 +627,23 @@ mpa_setup_paths() {
         rc=1
     fi
 
-    if ! mkdir -p -- "$MPARCHIVE_LOG_DIR" 2>/dev/null; then
+    # Create the log folder with mode 700. The logs can contain account logins.
+    if ! ( umask 077; mkdir -p -- "$MPARCHIVE_LOG_DIR" ) 2>/dev/null; then
         local bad="$MPARCHIVE_LOG_DIR"
         # Write the next messages to stderr only.
         MPARCHIVE_LOG_DIR=""
         log_error "Cannot create log directory: ${bad}. Create it and give the user who runs mp-archive write access."
         MPARCHIVE_LOG_DIR="$bad"
+    else
+        # Older versions made the log files with the umask of the caller.
+        # Remove the group and other bits from the files that this user owns.
+        local logf
+        for logf in activity.log error.log; do
+            logf="${MPARCHIVE_LOG_DIR}/${logf}"
+            if [[ -f "$logf" && ! -L "$logf" && -O "$logf" ]]; then
+                chmod go-rwx -- "$logf" 2>/dev/null || true
+            fi
+        done
     fi
     [[ "$rc" -eq 0 ]] || log_error "Cannot load the settings from ${MPA_ENV_FILE}"
     return "$rc"
@@ -857,4 +873,124 @@ archive_check_members() {
         done
     done
     printf '%s\n' "$top"
+}
+
+# ---------------------------------------------------------------------
+# Restore limits
+# ---------------------------------------------------------------------
+
+# Print an upper limit for the inodes that an extraction can create.
+# Argument: a file with the output of "tar -tzf". Tar creates each missing
+# parent folder of a member, so each path part can use one inode.
+# Folders that members share are counted again, so the result is an upper limit.
+archive_inode_bound() {
+    awk -F/ '{ n = 0; for (j = 1; j <= NF; j++) if ($j != "" && $j != ".") n++; c += (n > 0 ? n : 1) } END { print c + 0 }' "${1-}"
+}
+
+# Print the count of bytes of the decompressed tar stream of a gzip file.
+# Stop the count at <limit> + 1 bytes, so that a very large stream does not
+# use time without limit. Return 1 when the gzip data is not valid.
+# Arguments: <file> <limit>
+archive_stream_bytes() {
+    local file="${1-}" limit="${2-}" out
+    [[ "$limit" =~ ^[0-9]+$ ]] || return 1
+    # 10#: a value such as "08" is decimal, not octal.
+    out="$(set -o pipefail; { gzip -dc -- "$file" 2>/dev/null || [[ $? -eq 141 ]]; } | head -c "$((10#$limit + 1))" | wc -c)" || return 1
+    out="${out//[[:space:]]/}"
+    [[ "$out" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$((10#$out))"
+}
+
+# ---------------------------------------------------------------------
+# Archive manifest (integrity of the parts)
+# ---------------------------------------------------------------------
+# upload.sh writes one manifest file for each archive in the local state
+# folder. download.sh compares the downloaded parts with it. Box content is
+# not trusted, so a changed or added part is found before extraction.
+# Format, one item on each line:
+#   version 1
+#   archive <name>
+#   parts <count>
+#   bytes <total size of the joined archive>
+#   sha256 <SHA-256 of the joined archive>
+#   part <index> <size> <SHA-256 of the part>
+
+# Print the path of the manifest file of an archive.
+manifest_path() {
+    printf '%s/manifests/%s.manifest\n' "${MPARCHIVE_STATE_DIR:?}" "${1-}"
+}
+
+# Print the SHA-256 value of a file.
+_sha256_of() {
+    local out
+    out="$(sha256sum -- "${1-}")" || return 1
+    printf '%s\n' "${out%% *}"
+}
+
+# Write the manifest of an archive. The file is replaced atomically.
+# Arguments: <archive> <joined archive file> <part file>...
+manifest_write() {
+    local archive="${1-}" joined="${2-}" dest dir tmp i=0 f size sum
+    shift 2
+    dest="$(manifest_path "$archive")" || return 1
+    dir="${dest%/*}"
+    ( umask 077; mkdir -p -- "$dir" ) || return 1
+    tmp="$(umask 077; mktemp -- "${dest}.XXXXXX")" || return 1
+    # A subshell: "exit 1" stops only the subshell, not the caller.
+    (
+        printf 'version 1\n'
+        printf 'archive %s\n' "$archive"
+        printf 'parts %d\n' "$#"
+        printf 'bytes %s\n' "$(file_size "$joined")"
+        printf 'sha256 %s\n' "$(_sha256_of "$joined")"
+        for f in "$@"; do
+            size="$(file_size "$f")" || exit 1
+            sum="$(_sha256_of "$f")" || exit 1
+            printf 'part %d %s %s\n' "$i" "$size" "$sum"
+            i=$((i + 1))
+        done
+    ) >"$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+}
+
+# Compare downloaded parts with the manifest of an archive.
+# Arguments: <archive> <joined archive file> <part file>...
+# Return 0 when they match, 1 when they do not match (the reason is logged),
+# and 3 when no manifest exists.
+manifest_verify() {
+    local archive="${1-}" joined="${2-}" mf key a b c want_parts="" want_bytes="" want_sum="" i=0 f
+    local -a psize=() psum=()
+    shift 2
+    mf="$(manifest_path "$archive")" || return 1
+    [[ -f "$mf" ]] || return 3
+    while read -r key a b c; do
+        case "$key" in
+            version) [[ "$a" == "1" ]] || { log_error "Manifest '$mf' has an unknown version"; return 1; } ;;
+            archive) [[ "$a" == "$archive" ]] || { log_error "Manifest '$mf' is for another archive"; return 1; } ;;
+            parts) want_parts="$a" ;;
+            bytes) want_bytes="$a" ;;
+            sha256) want_sum="$a" ;;
+            part) psize[a]="$b"; psum[a]="$c" ;;
+        esac
+    done <"$mf"
+    if [[ ! "$want_parts" =~ ^[0-9]+$ || -z "$want_sum" ]]; then
+        log_error "Manifest '$mf' is not complete"
+        return 1
+    fi
+    if (($# != want_parts)); then
+        log_error "Archive '$archive' has $# parts, but the manifest has $want_parts"
+        return 1
+    fi
+    for f in "$@"; do
+        if [[ "$(file_size "$f")" != "${psize[i]:-}" || "$(_sha256_of "$f")" != "${psum[i]:-}" ]]; then
+            log_error "Part $i of '$archive' does not match the manifest. The part was changed after the upload."
+            return 1
+        fi
+        i=$((i + 1))
+    done
+    if [[ "$(file_size "$joined")" != "$want_bytes" || "$(_sha256_of "$joined")" != "$want_sum" ]]; then
+        log_error "Archive '$archive' does not match the manifest"
+        return 1
+    fi
+    return 0
 }

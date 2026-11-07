@@ -31,6 +31,8 @@ if [[ ! -e "$CONTENT_PATH" ]]; then
 fi
 
 mpa_init
+# Use a low CPU priority and a low disk priority for tar, gzip and curl.
+mpa_lower_priority || die "The priority settings are not valid. Read the errors above."
 N="$MPA_ACCOUNT_COUNT"
 
 # Resolve the absolute path. This handles trailing slashes and relative paths.

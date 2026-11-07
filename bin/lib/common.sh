@@ -683,6 +683,78 @@ mpa_init() {
 }
 
 # ---------------------------------------------------------------------
+# CPU priority and disk priority
+# ---------------------------------------------------------------------
+
+# Lower the CPU priority and the disk priority of this script.
+# The processes that the script starts after this call (tar, gzip, split,
+# sha256sum, curl) get the same priorities. Thus, a backup or a restore
+# does not slow down the other services on the host.
+# Settings (an empty value means "do not change"):
+#   MPARCHIVE_NICE          The niceness, 0 to 19. Default: 10.
+#   MPARCHIVE_IONICE_CLASS  2 (best-effort, lowest level 7) or 3 (idle). Default: 3.
+# The function never makes a priority higher than it is now.
+# A missing tool or a failed change gives a warning only.
+# Return 1 when a value is not valid.
+mpa_lower_priority() {
+    local nice_want="${MPARCHIVE_NICE-10}" io_class="${MPARCHIVE_IONICE_CLASS-3}"
+    local nice_now io_now
+    local -a io_args=()
+
+    # Check all values before a change.
+    if [[ -n "$nice_want" ]]; then
+        # Allow leading zeros, then at most 2 digits. A very long number
+        # must not wrap around in the arithmetic and look valid.
+        if [[ ! "$nice_want" =~ ^0*([0-9]{1,2})$ ]] || ((10#${BASH_REMATCH[1]} > 19)); then
+            log_error "MPARCHIVE_NICE must be an integer from 0 to 19 (now: ${nice_want})."
+            return 1
+        fi
+        # 10#: a value such as "08" is decimal, not octal.
+        nice_want=$((10#${BASH_REMATCH[1]}))
+    fi
+    case "$io_class" in
+        "") ;;
+        2) io_args=(-c 2 -n 7) ;;
+        3) io_args=(-c 3) ;;
+        *)
+            log_error "MPARCHIVE_IONICE_CLASS must be 2 or 3 (now: ${io_class})."
+            return 1
+            ;;
+    esac
+
+    # CPU priority. "nice" without a command prints the current niceness.
+    if [[ -n "$nice_want" ]]; then
+        nice_now="$(nice 2>/dev/null)" || nice_now=""
+        if [[ ! "$nice_now" =~ ^-?[0-9]+$ ]]; then
+            log_error "Warning: cannot read the CPU priority. The CPU priority is not changed."
+        elif ((nice_now < nice_want)); then
+            if ! command -v renice >/dev/null 2>&1; then
+                log_error "Warning: renice is not installed. The CPU priority is not changed."
+            # "--priority" sets the value, it does not add to it. Read the
+            # niceness again, because some renice programs work differently.
+            elif ! renice --priority "$nice_want" -p "$$" >/dev/null 2>&1 \
+                || [[ "$(nice 2>/dev/null)" != "$nice_want" ]]; then
+                log_error "Warning: cannot set the CPU priority (niceness) to ${nice_want}."
+            fi
+        fi
+    fi
+
+    # Disk priority. Do not change the class "idle", because it is the lowest.
+    if ((${#io_args[@]} > 0)); then
+        if ! command -v ionice >/dev/null 2>&1; then
+            log_error "Warning: ionice is not installed. The disk priority is not changed."
+        else
+            io_now="$(ionice -p "$$" 2>/dev/null)" || io_now=""
+            if [[ "$io_now" != idle* ]] \
+                && ! ionice "${io_args[@]}" -p "$$" >/dev/null 2>&1; then
+                log_error "Warning: cannot set the disk priority (ionice ${io_args[*]})."
+            fi
+        fi
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------
 # Archive names and part names
 # ---------------------------------------------------------------------
 

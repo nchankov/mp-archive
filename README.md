@@ -25,6 +25,7 @@ At this time, mp-archive supports only Box. Support for Dropbox, pCloud and Goog
 - [Commands](#commands)
 - [Access tokens and refresh tokens](#access-tokens-and-refresh-tokens)
 - [Run a backup each day](#run-a-backup-each-day)
+- [CPU priority and disk priority](#cpu-priority-and-disk-priority)
 - [Update mp-archive](#update-mp-archive)
 - [Logs and errors](#logs-and-errors)
 - [Security](#security)
@@ -35,6 +36,7 @@ At this time, mp-archive supports only Box. Support for Dropbox, pCloud and Goog
 - Linux with Bash 4 or later.
 - The standard coreutils (`split`, `cat`, `du`, `stat`, `sha1sum`, `base64` and similar).
 - `curl`, `tar` and `gzip`.
+- Optional: `renice` and `ionice` from util-linux. mp-archive uses them to [lower the CPU priority and the disk priority](#cpu-priority-and-disk-priority). Most Linux systems have util-linux. If a tool is missing, mp-archive writes a warning and uses the normal priority.
 - One or more Box accounts. A free Box account is sufficient.
 
 mp-archive does not use `jq`, Python or other tools.
@@ -220,6 +222,11 @@ BOX_FOLDER_ID=0
 
 # The redirect URI. It must be the same as the URI in the Box app.
 BOX_REDIRECT_URI=http://localhost
+
+# The CPU priority (niceness, 0 to 19) and the disk priority class (2 or 3).
+# Empty means "do not change". See "CPU priority and disk priority".
+MPARCHIVE_NICE=10
+MPARCHIVE_IONICE_CLASS=3
 ```
 
 The file has a secret. Keep it private:
@@ -544,6 +551,31 @@ Use full paths in the cron table, because cron does not start in the project fol
 This example uploads the backup each day at 02:00. Each run replaces the previous backup with the same name.
 
 A daily backup also keeps the refresh tokens valid.
+
+## CPU priority and disk priority
+
+The compression and the extraction of an archive use much CPU time and much disk access. Thus, `upload.sh` and `download.sh` lower their own priorities when they start. All processes that they start (`tar`, `gzip`, `split`, `sha256sum`, `curl`) get the same priorities. The other services on the host keep their speed. A backup can take more time when the host is busy.
+
+Two settings in `.env` control the priorities:
+
+| Setting | Values | Default | Tool |
+|---|---|---|---|
+| `MPARCHIVE_NICE` | `0` (normal) to `19` (lowest CPU priority) | `10` | `renice` |
+| `MPARCHIVE_IONICE_CLASS` | `3` (idle) or `2` (best-effort, lowest level) | `3` | `ionice` |
+
+Rules:
+
+- An empty value means "do not change". For example, `MPARCHIVE_NICE=` keeps the normal CPU priority.
+- If the setting is not in `.env`, mp-archive uses the default.
+- mp-archive never makes a priority higher. If you start the script with `nice -n 15`, the niceness stays 15.
+- A value that is not valid stops the script before it does work.
+- If `renice` or `ionice` is missing or fails, mp-archive writes a warning in `error.log` and continues.
+
+With class `3` (idle), the backup uses the disk only when no other process uses it. If the disk is always busy, the backup can wait for a very long time. Then set `MPARCHIVE_IONICE_CLASS=2`.
+
+The disk priority has an effect only if the disk scheduler of the kernel uses priorities. The `bfq` scheduler uses them fully. Other schedulers use them partly or not at all, for example `none`. To see the scheduler of a disk, run `cat /sys/block/<disk>/queue/scheduler`.
+
+The other commands (`exists.sh`, `remove.sh`, `add-account.sh`) do little work. They do not change the priorities.
 
 ## Update mp-archive
 

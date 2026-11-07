@@ -31,6 +31,8 @@ if [[ -z "$TARGET" ]]; then
 fi
 
 mpa_init
+# Use a low CPU priority and a low disk priority for tar, gzip and curl.
+mpa_lower_priority || die "The priority settings are not valid. Read the errors above."
 N="$MPA_ACCOUNT_COUNT"
 
 # Make a temp dir. Remove it when the script ends.

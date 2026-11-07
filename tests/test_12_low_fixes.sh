@@ -595,7 +595,9 @@ test_octal_looking_caps_refuse_like_decimal() {
     run_cmd env MPARCHIVE_RESTORE_MAX_BYTES=08 "$DOWNLOAD" backup1 "$TARGET"
     assert_eq "1" "$RUN_RC" "exit code with a cap of 08" || return 1
     line08="$(error_line "can need more than")"
-    # The free space in the message can change between runs. Compare the text before it.
+    # The timestamp and the free space can change between runs.
+    # Compare the text after the timestamp and before the free space.
+    line8="${line8#* }"; line08="${line08#* }"
     assert_eq "${line8%% (free*}" "${line08%% (free*}" "cap 08 gives the same refusal as cap 8" || return 1
 
     run_cmd env MPARCHIVE_RESTORE_MAX_BYTES=010 "$DOWNLOAD" backup1 "$TARGET"
